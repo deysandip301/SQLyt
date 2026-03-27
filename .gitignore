@@ -1,0 +1,8 @@
+# C build artifacts
+/db
+*.o
+*.out
+
+# Python cache files
+__pycache__/
+*.py[cod]
