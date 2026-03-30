@@ -162,6 +162,60 @@ class TestDatabase(unittest.TestCase):
         finally:
             os.remove(db_filename)
 
+    def test_allows_printing_out_the_structure_of_a_one_node_btree(self):
+        db_filename = self.make_db_path()
+        try:
+            script = [
+                "insert 3 user3 person3@example.com",
+                "insert 1 user1 person1@example.com",
+                "insert 2 user2 person2@example.com",
+                ".btree",
+                ".exit",
+            ]
+
+            result = self.run_script(script, db_filename)
+
+            self.assertCountEqual(
+                result,
+                [
+                    "db > Executed.",
+                    "db > Executed.",
+                    "db > Executed.",
+                    "db > Tree:",
+                    "leaf (size 3)",
+                    "  - 0 : 3",
+                    "  - 1 : 1",
+                    "  - 2 : 2",
+                    "db > ",
+                ],
+            )
+        finally:
+            os.remove(db_filename)
+    
+    def test_prints_constants(self):
+        db_filename = self.make_db_path()
+        try:
+            result = self.run_script([
+                ".constants",
+                ".exit",
+            ], db_filename)
+
+            self.assertCountEqual(
+                result,
+                [
+                    "db > Constants:",
+                    "ROW_SIZE: 293",
+                    "COMMON_NODE_HEADER_SIZE: 6",
+                    "LEAF_NODE_HEADER_SIZE: 10",
+                    "LEAF_NODE_CELL_SIZE: 297",
+                    "LEAF_NODE_SPACE_FOR_CELLS: 4086",
+                    "LEAF_NODE_MAX_CELLS: 13",
+                    "db > ",
+                ],
+            )
+        finally:
+            os.remove(db_filename)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
