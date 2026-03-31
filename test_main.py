@@ -92,7 +92,7 @@ class TestDatabase(unittest.TestCase):
                 result[-2:],
                 [
                     "db > Executed.",
-                    "db > Need to implement splitting internal node",
+                    "db > ",
                 ],
             )
         finally:    
