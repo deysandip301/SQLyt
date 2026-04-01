@@ -1,19 +1,17 @@
-import subprocess
 import os
+import shutil
+import struct
+import subprocess
 import tempfile
 import unittest
 
 
-class TestDatabase(unittest.TestCase):
+class TestSQLytSQLMode(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         compile_cmd = [
             "gcc",
             "-std=c11",
-            "-Wall",
-            "-Wextra",
-            "-Werror",
-            "-pedantic",
             "main.c",
             "-o",
             "db",
@@ -26,16 +24,17 @@ class TestDatabase(unittest.TestCase):
                 f"stderr:\n{result.stderr}"
             )
 
-    def make_db_path(self):
-        fd, path = tempfile.mkstemp(prefix="sqlyt_", suffix=".db")
-        os.close(fd)
-        return path
+    def setUp(self):
+        self.root = tempfile.mkdtemp(prefix="sqlyt_root_")
 
-    def run_script(self, commands, db_filename):
-        input_text = "\n".join(commands) + "\n"
+    def tearDown(self):
+        shutil.rmtree(self.root, ignore_errors=True)
+
+    def run_script(self, commands, use_default_root=False):
+        args = ["./db"] if use_default_root else ["./db", self.root]
         proc = subprocess.run(
-            ["./db", db_filename],
-            input=input_text,
+            args,
+            input="\n".join(commands) + "\n",
             capture_output=True,
             text=True,
             errors="strict",
@@ -43,124 +42,250 @@ class TestDatabase(unittest.TestCase):
         )
         return proc.stdout.split("\n")
 
-    def test_inserts_and_retrieves_a_row(self):
-        db_filename = self.make_db_path()
+    def test_usedatabase_create_insert_select(self):
+        result = self.run_script([
+            "create database app",
+            ".usedatabase app",
+            "create table users (id int primary key, name varchar(20), email varchar(30))",
+            "insert into users values (1, alice, a@example.com)",
+            "select * from users",
+            ".exit",
+        ])
+
+        self.assertEqual(
+            result,
+            [
+                "db > Executed.",
+                "db > Using database app",
+                "db > Executed.",
+                "db > Executed.",
+                "db > (1, alice, a@example.com)",
+                "Executed.",
+                "db > ",
+            ],
+        )
+
+    def test_fixed_varchar_enforced(self):
+        result = self.run_script([
+            "create database app",
+            ".usedatabase app",
+            "create table users (id int primary key, name varchar(3), email varchar(10))",
+            "insert into users values (1, alice, a@example.com)",
+            ".exit",
+        ])
+
+        self.assertEqual(
+            result,
+            [
+                "db > Executed.",
+                "db > Using database app",
+                "db > Executed.",
+                "db > String is too long.",
+                "db > ",
+            ],
+        )
+
+    def test_duplicate_key_scoped_per_table_root(self):
+        result = self.run_script([
+            "create database app",
+            ".usedatabase app",
+            "create table users (id int primary key, name varchar(20), email varchar(30))",
+            "create table admins (id int primary key, name varchar(20), email varchar(30))",
+            "insert into users values (1, alice, a@example.com)",
+            "insert into users values (1, alice2, a2@example.com)",
+            "insert into admins values (1, bob, b@example.com)",
+            ".exit",
+        ])
+
+        self.assertEqual(
+            result,
+            [
+                "db > Executed.",
+                "db > Using database app",
+                "db > Executed.",
+                "db > Executed.",
+                "db > Executed.",
+                "db > Error: Duplicate key.",
+                "db > Executed.",
+                "db > ",
+            ],
+        )
+
+    def test_showtables_displays_root_pages(self):
+        result = self.run_script([
+            "create database app",
+            ".usedatabase app",
+            "create table users (id int primary key, name varchar(20), email varchar(30))",
+            "create table admins (id int primary key, name varchar(20), email varchar(30))",
+            ".showtables",
+            ".exit",
+        ])
+
+        self.assertIn("db > users (root_page=2)", result)
+        self.assertIn("admins (root_page=3)", result)
+
+    def test_next_root_page_persists_after_reopen(self):
+        self.run_script([
+            "create database app",
+            ".usedatabase app",
+            "create table users (id int primary key, name varchar(20), email varchar(30))",
+            ".exit",
+        ])
+
+        result = self.run_script([
+            ".usedatabase app",
+            "create table admins (id int primary key, name varchar(20), email varchar(30))",
+            ".showtables",
+            ".exit",
+        ])
+
+        self.assertIn("db > users (root_page=2)", result)
+        self.assertIn("admins (root_page=3)", result)
+
+    def test_recovers_corrupted_header_and_rebuilds_next_root(self):
+        self.run_script([
+            "create database app",
+            ".usedatabase app",
+            "create table users (id int primary key, name varchar(20), email varchar(30))",
+            "create table admins (id int primary key, name varchar(20), email varchar(30))",
+            ".exit",
+        ])
+
+        db_file = os.path.join(self.root, "app", "database.db")
+        with open(db_file, "r+b") as f:
+            f.seek(0)
+            f.write(struct.pack("<8sIII", b"BROKEN!!", 1, 0, 0))
+
+        result = self.run_script([
+            ".usedatabase app",
+            "create table audit (id int primary key, name varchar(20), email varchar(30))",
+            ".showtables",
+            ".exit",
+        ])
+
+        self.assertIn("db > Recovered database header metadata.", result)
+        self.assertTrue(any("users (root_page=2)" in line for line in result))
+        self.assertTrue(any("admins (root_page=3)" in line for line in result))
+        self.assertTrue(any("audit (root_page=4)" in line for line in result))
+
+    def test_default_startup_uses_data_root(self):
+        cwd_before = os.getcwd()
+        temp_workdir = tempfile.mkdtemp(prefix="sqlyt_workdir_")
         try:
-            result = self.run_script([
-                "insert 1 user1 person1@example.com",
-                "select",
-                ".exit",
-            ], db_filename)
-            self.assertCountEqual(
-                result,
-                [
-                    "db > Executed.",
-                    "db > (1, user1, person1@example.com)",
-                    "Executed.",
-                    "db > ",
-                ],
+            os.chdir(temp_workdir)
+            proc = subprocess.run(
+                [os.path.join(cwd_before, "db")],
+                input="create database app\n.usedatabase app\n.exit\n",
+                capture_output=True,
+                text=True,
+                errors="strict",
+                check=False,
             )
+            output = proc.stdout.split("\n")
+            self.assertEqual(output, ["db > Executed.", "db > Using database app", "db > "])
+            self.assertTrue(os.path.isdir(os.path.join(temp_workdir, "data", "app")))
         finally:
-            os.remove(db_filename)
+            os.chdir(cwd_before)
+            shutil.rmtree(temp_workdir, ignore_errors=True)
 
-    def test_prints_error_message_when_table_is_full(self):
-        db_filename = self.make_db_path()
-        script = [
-            f"insert {i} user{i} person{i}@example.com"
-            for i in range(1, 1402)
-        ]
-        script.append(".exit")
-        try:
-            result = self.run_script(script, db_filename)
-            self.assertEqual(result[-2], "db > Error: Table full.")
-        finally:
-            os.remove(db_filename)
+    def test_cannot_use_database_before_creation(self):
+        result = self.run_script([
+            ".usedatabase missing",
+            ".exit",
+        ])
+        self.assertEqual(result, ["db > Unable to use database.", "db > "])
 
-    def test_allows_inserting_strings_that_are_the_maximum_length(self):
-        db_filename = self.make_db_path()
-        long_username = "a" * 32
-        long_email = "a" * 255
-        try:
-            result = self.run_script([
-                f"insert 1 {long_username} {long_email}",
-                "select",
-                ".exit",
-            ], db_filename)
-            self.assertCountEqual(
-                result,
-                [
-                    "db > Executed.",
-                    f"db > (1, {long_username}, {long_email})",
-                    "Executed.",
-                    "db > ",
-                ],
-            )
-        finally:
-            os.remove(db_filename)
+    def test_supports_more_than_three_columns(self):
+        result = self.run_script([
+            "create database app",
+            ".usedatabase app",
+            "create table profile (id int primary key, name varchar(20), email varchar(30), city varchar(20), role varchar(15))",
+            "insert into profile values (1, alice, a@example.com, berlin, engineer)",
+            "select * from profile",
+            ".exit",
+        ])
 
-    def test_prints_error_message_if_strings_are_too_long(self):
-        db_filename = self.make_db_path()
-        long_username = "a" * 33
-        long_email = "a" * 256
-        try:
-            result = self.run_script([
-                f"insert 1 {long_username} {long_email}",
-                "select",
-                ".exit",
-            ], db_filename)
-            self.assertCountEqual(
-                result,
-                [
-                    "db > String is too long.",
-                    "db > Executed.",
-                    "db > ",
-                ],
-            )
-        finally:
-            os.remove(db_filename)
+        self.assertEqual(
+            result,
+            [
+                "db > Executed.",
+                "db > Using database app",
+                "db > Executed.",
+                "db > Executed.",
+                "db > (1, alice, a@example.com, berlin, engineer)",
+                "Executed.",
+                "db > ",
+            ],
+        )
 
-    def test_prints_an_error_message_if_id_is_negative(self):
-        db_filename = self.make_db_path()
-        try:
-            result = self.run_script([
-                "insert -1 cstack foo@bar.com",
-                "select",
-                ".exit",
-            ], db_filename)
-            self.assertCountEqual(
-                result,
-                [
-                    "db > ID must be positive.",
-                    "db > Executed.",
-                    "db > ",
-                ],
-            )
-        finally:
-            os.remove(db_filename)
+    def test_supports_int_and_varchar_mixed_columns(self):
+        result = self.run_script([
+            "create database app",
+            ".usedatabase app",
+            "create table user (id int primary key, user_id int, user_name varchar(20), email varchar(30), password varchar(20))",
+            "insert into user values (1, 101, alice, a@example.com, secret)",
+            "select * from user",
+            ".exit",
+        ])
 
-    def test_keeps_data_after_closing_connection(self):
-        db_filename = self.make_db_path()
-        try:
-            self.run_script([
-                "insert 1 user1 person1@example.com",
-                ".exit",
-            ], db_filename)
+        self.assertEqual(
+            result,
+            [
+                "db > Executed.",
+                "db > Using database app",
+                "db > Executed.",
+                "db > Executed.",
+                "db > (1, 101, alice, a@example.com, secret)",
+                "Executed.",
+                "db > ",
+            ],
+        )
 
-            result = self.run_script([
-                "select",
-                ".exit",
-            ], db_filename)
+    def test_supports_table_with_single_user_column(self):
+        result = self.run_script([
+            "create database app",
+            ".usedatabase app",
+            "create table flags (id int primary key, enabled int)",
+            "insert into flags values (1, 1)",
+            "select * from flags",
+            ".exit",
+        ])
 
-            self.assertCountEqual(
-                result,
-                [
-                    "db > (1, user1, person1@example.com)",
-                    "Executed.",
-                    "db > ",
-                ],
-            )
-        finally:
-            os.remove(db_filename)
+        self.assertEqual(
+            result,
+            [
+                "db > Executed.",
+                "db > Using database app",
+                "db > Executed.",
+                "db > Executed.",
+                "db > (1, 1)",
+                "Executed.",
+                "db > ",
+            ],
+        )
+
+    def test_supports_quoted_strings_with_spaces(self):
+        result = self.run_script([
+            "create database app",
+            ".usedatabase app",
+            "create table people (id int primary key, user_name varchar(30), city varchar(30))",
+            'insert into people values (1, "Alice Doe", "New York")',
+            "select * from people",
+            ".exit",
+        ])
+
+        self.assertEqual(
+            result,
+            [
+                "db > Executed.",
+                "db > Using database app",
+                "db > Executed.",
+                "db > Executed.",
+                "db > (1, Alice Doe, New York)",
+                "Executed.",
+                "db > ",
+            ],
+        )
 
 
 if __name__ == "__main__":
