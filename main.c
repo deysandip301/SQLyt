@@ -572,6 +572,8 @@ Cursor* table_start(Table* table) {
   return cursor;
 }
 
+void internal_node_split_and_insert(Table* table, uint32_t parent_page_num, uint32_t child_page_num);
+
 void* cursor_value(Cursor* cursor) {
   uint32_t page_num = cursor->page_num;
   void* page = get_page(cursor->table->pager, page_num);

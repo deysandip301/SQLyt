@@ -12,6 +12,10 @@ class TestSQLytSQLMode(unittest.TestCase):
         compile_cmd = [
             "gcc",
             "-std=c11",
+            #"-Wall",
+            #"-Wextra",
+            # "-Werror",
+            #"-pedantic",
             "main.c",
             "-o",
             "db",
