@@ -287,6 +287,23 @@ class TestSQLytSQLMode(unittest.TestCase):
             ],
         )
 
+    def test_btree_node_split_when(self):
+        table = "bigtree"
+        commands = [
+            "create database app",
+            ".usedatabase app",
+            f"create table {table} (id int primary key, name varchar(20))",
+        ]
+        for i in range(1, 14):
+            commands.append(f"insert into {table} values ({i}, row{i})")
+        commands.extend([f".btree {table}", ".exit"])
+
+        result = self.run_script(commands)
+        out = "\n".join(result)
+        print(out)
+
+        self.assertIn("Tree:", out)
+        # self.assertIn("internal", out)
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
