@@ -23,52 +23,44 @@ typedef enum {
 
 typedef enum {
   META_COMMAND_SUCCESS,
-  META_COMMAND_UNRECOGNIZED_COMMAND
+  META_COMMAND_UNRECOGNIZED_COMMAND,
+  META_COMMAND_EXIT
 } MetaCommandResult;
 
-typedef enum {
-  PREPARE_SUCCESS,
-  PREPARE_NEGATIVE_ID,
-  PREPARE_STRING_TOO_LONG,
-  PREPARE_SYNTAX_ERROR,
-  PREPARE_UNRECOGNIZED_STATEMENT
-} PrepareResult;
-
-typedef enum { STATEMENT_INSERT, STATEMENT_SELECT } StatementType;
-
-#define COLUMN_USERNAME_SIZE 32
-#define COLUMN_EMAIL_SIZE 255
 #define DEFAULT_ROOT_PATH "./data"
 #define DATABASE_FILE_NAME "database.db"
 #define MAX_TABLE_NAME_LENGTH 28
-#define MASTER_TAG_PREFIX "m"
 #define MAX_SCHEMA_COLUMNS 10
 #define MAX_COLUMN_NAME_LENGTH 24
 #define MAX_CELL_TEXT 64
 #define COLUMN_TYPE_INT 1
 #define COLUMN_TYPE_VARCHAR 2
 #define DB_HEADER_MAGIC "SQLYTDB1"
-#define DB_FORMAT_VERSION 1
+#define DB_FORMAT_VERSION 2
 #define DB_HEADER_MASTER_ROOT_PAGE 1
 #define DB_HEADER_FIRST_USER_ROOT_PAGE 2
-typedef struct {
-  uint32_t id;
-  char username[COLUMN_USERNAME_SIZE + 1];
-  char email[COLUMN_EMAIL_SIZE + 1];
-} Row;
 
-typedef struct {
-  StatementType type;
-  Row row_to_insert;  // only used by insert statement
-} Statement;
+/* Catalog (sqlite_master) row: btree key = root_page; value layout is fixed. */
+#define CATALOG_TABLE_NAME_SIZE 32
+#define CATALOG_SCHEMA_STORAGE 512
+#define CATALOG_VALUE_SIZE \
+  (sizeof(uint32_t) + CATALOG_TABLE_NAME_SIZE + CATALOG_SCHEMA_STORAGE)
+#define SCHEMA_TEXT_MAX CATALOG_SCHEMA_STORAGE
+#define SQL_LINE_BUF 1024
 
 typedef struct {
   uint32_t column_count;
   char column_names[MAX_SCHEMA_COLUMNS][MAX_COLUMN_NAME_LENGTH + 1];
   uint32_t column_type[MAX_SCHEMA_COLUMNS];
   uint32_t column_max[MAX_SCHEMA_COLUMNS];
-  char create_sql[COLUMN_EMAIL_SIZE + 1];
+  char create_sql[SCHEMA_TEXT_MAX + 1];
 } SqlSchema;
+
+typedef struct {
+  uint32_t value_size;
+  uint32_t col_offset[MAX_SCHEMA_COLUMNS];
+  uint32_t col_size[MAX_SCHEMA_COLUMNS];
+} RowLayout;
 
 typedef enum {
   SQL_STMT_CREATE_DATABASE,
@@ -88,22 +80,29 @@ typedef struct {
   SqlSchema schema;
 } SqlStatement;
 
+typedef enum {
+  SQL_EXEC_OK,
+  SQL_EXEC_CREATE_DB_FAILED,
+  SQL_EXEC_RESERVED_TABLE_NAME,
+  SQL_EXEC_TABLE_EXISTS,
+  SQL_EXEC_ROW_LAYOUT_TOO_LARGE,
+  SQL_EXEC_TABLE_NAME_TOO_LONG,
+  SQL_EXEC_SCHEMA_METADATA_TOO_LONG,
+  SQL_EXEC_DUPLICATE_KEY,
+  SQL_EXEC_TABLE_NOT_FOUND,
+  SQL_EXEC_WRONG_VALUE_COUNT,
+  SQL_EXEC_SCHEMA_INVALID_PK,
+  SQL_EXEC_INSERT_VALIDATION_FAILED,
+  SQL_EXEC_ROW_PACK_FAILED,
+  SQL_EXEC_SELECT_LAYOUT_INVALID,
+} SqlExecuteResult;
+
 typedef struct {
   char root_path[512];
   bool has_active_database;
   char active_database[MAX_TABLE_NAME_LENGTH + 1];
   Table* database;
 } Session;
-
-#define size_of_attribute(Struct, Attribute) sizeof(((Struct*)0)->Attribute)
-
-const uint32_t ID_SIZE = size_of_attribute(Row, id);
-const uint32_t USERNAME_SIZE = size_of_attribute(Row, username);
-const uint32_t EMAIL_SIZE = size_of_attribute(Row, email);
-const uint32_t ID_OFFSET = 0;
-const uint32_t USERNAME_OFFSET = ID_OFFSET + ID_SIZE;
-const uint32_t EMAIL_OFFSET = USERNAME_OFFSET + USERNAME_SIZE;
-const uint32_t ROW_SIZE = ID_SIZE + USERNAME_SIZE + EMAIL_SIZE;
 
 const uint32_t PAGE_SIZE = 4096;
 #define TABLE_MAX_PAGES 400
@@ -129,6 +128,12 @@ typedef struct {
 struct Table {
   Pager* pager;
   uint32_t root_page_num;
+  bool is_catalog;
+  uint32_t value_size;
+  uint32_t cell_size;
+  uint32_t max_cells;
+  SqlSchema schema;
+  RowLayout row_layout;
 };
 
 typedef struct {
@@ -137,10 +142,6 @@ typedef struct {
   uint32_t cell_num;
   bool end_of_table;  // Indicates a position one past the last element
 } Cursor;
-
-void print_row(Row* row) {
-  printf("(%d, %s, %s)\n", row->id, row->username, row->email);
-}
 
 typedef enum { NODE_INTERNAL, NODE_LEAF } NodeType;
 
@@ -195,16 +196,7 @@ const uint32_t LEAF_NODE_HEADER_SIZE = COMMON_NODE_HEADER_SIZE +
  */
 const uint32_t LEAF_NODE_KEY_SIZE = sizeof(uint32_t);
 const uint32_t LEAF_NODE_KEY_OFFSET = 0;
-const uint32_t LEAF_NODE_VALUE_SIZE = ROW_SIZE;
-const uint32_t LEAF_NODE_VALUE_OFFSET =
-    LEAF_NODE_KEY_OFFSET + LEAF_NODE_KEY_SIZE;
-const uint32_t LEAF_NODE_CELL_SIZE = LEAF_NODE_KEY_SIZE + LEAF_NODE_VALUE_SIZE;
-const uint32_t LEAF_NODE_SPACE_FOR_CELLS = PAGE_SIZE - LEAF_NODE_HEADER_SIZE;
-const uint32_t LEAF_NODE_MAX_CELLS =
-    LEAF_NODE_SPACE_FOR_CELLS / LEAF_NODE_CELL_SIZE;
-const uint32_t LEAF_NODE_RIGHT_SPLIT_COUNT = (LEAF_NODE_MAX_CELLS + 1) / 2;
-const uint32_t LEAF_NODE_LEFT_SPLIT_COUNT =
-    (LEAF_NODE_MAX_CELLS + 1) - LEAF_NODE_RIGHT_SPLIT_COUNT;
+#define LEAF_NODE_SPACE_FOR_CELLS (PAGE_SIZE - LEAF_NODE_HEADER_SIZE)
 
 NodeType get_node_type(void* node) {
   uint8_t value = *((uint8_t*)(node + NODE_TYPE_OFFSET));
@@ -274,16 +266,66 @@ uint32_t* leaf_node_next_leaf(void* node) {
   return node + LEAF_NODE_NEXT_LEAF_OFFSET;
 }
 
-void* leaf_node_cell(void* node, uint32_t cell_num) {
-  return node + LEAF_NODE_HEADER_SIZE + cell_num * LEAF_NODE_CELL_SIZE;
+void table_init_catalog(Table* t, Pager* pager) {
+  t->pager = pager;
+  t->root_page_num = pager->master_root_page;
+  t->is_catalog = true;
+  memset(&t->schema, 0, sizeof(t->schema));
+  memset(&t->row_layout, 0, sizeof(t->row_layout));
+  t->value_size = CATALOG_VALUE_SIZE;
+  t->cell_size = LEAF_NODE_KEY_SIZE + t->value_size;
+  t->max_cells = LEAF_NODE_SPACE_FOR_CELLS / t->cell_size;
 }
 
-uint32_t* leaf_node_key(void* node, uint32_t cell_num) {
-  return leaf_node_cell(node, cell_num);
+bool compute_row_layout(const SqlSchema* schema, RowLayout* L) {
+  L->value_size = 0;
+  for (uint32_t i = 0; i < schema->column_count; i++) {
+    L->col_offset[i] = L->value_size;
+    if (schema->column_type[i] == COLUMN_TYPE_INT) {
+      L->col_size[i] = sizeof(uint32_t);
+    } else {
+      L->col_size[i] = schema->column_max[i];
+    }
+    L->value_size += L->col_size[i];
+  }
+  uint32_t cell = LEAF_NODE_KEY_SIZE + L->value_size;
+  if (L->value_size == 0 || cell > LEAF_NODE_SPACE_FOR_CELLS) {
+    return false;
+  }
+  return true;
 }
 
-void* leaf_node_value(void* node, uint32_t cell_num) {
-  return leaf_node_cell(node, cell_num) + LEAF_NODE_KEY_SIZE;
+bool table_init_user(Table* t, Pager* pager, uint32_t root_page,
+                     const SqlSchema* schema) {
+  t->pager = pager;
+  t->root_page_num = root_page;
+  t->is_catalog = false;
+  memcpy(&t->schema, schema, sizeof(SqlSchema));
+  if (!compute_row_layout(schema, &t->row_layout)) {
+    return false;
+  }
+  t->value_size = t->row_layout.value_size;
+  t->cell_size = LEAF_NODE_KEY_SIZE + t->value_size;
+  t->max_cells = LEAF_NODE_SPACE_FOR_CELLS / t->cell_size;
+  return t->max_cells > 0;
+}
+
+static inline void* tbl_leaf_cell(Table* t, void* node, uint32_t cell_num) {
+  return (uint8_t*)node + LEAF_NODE_HEADER_SIZE + cell_num * t->cell_size;
+}
+
+static inline uint32_t* tbl_leaf_key(Table* t, void* node, uint32_t cell_num) {
+  return (uint32_t*)tbl_leaf_cell(t, node, cell_num);
+}
+
+static inline void* tbl_leaf_value(Table* t, void* node, uint32_t cell_num) {
+  return (uint8_t*)tbl_leaf_cell(t, node, cell_num) + LEAF_NODE_KEY_SIZE;
+}
+
+static inline uint32_t* leaf_key_sized(void* node, uint32_t cell_num,
+                                       uint32_t cell_size) {
+  return (uint32_t*)((uint8_t*)node + LEAF_NODE_HEADER_SIZE +
+                     cell_num * cell_size);
 }
 
 void* get_page(Pager* pager, uint32_t page_num) {
@@ -322,21 +364,27 @@ void* get_page(Pager* pager, uint32_t page_num) {
   return pager->pages[page_num];
 }
 
-uint32_t get_node_max_key(Pager* pager, void* node) {
+uint32_t get_node_max_key(Table* table, void* node) {
   if (get_node_type(node) == NODE_LEAF) {
-    return *leaf_node_key(node, *leaf_node_num_cells(node) - 1);
+    uint32_t n = *leaf_node_num_cells(node);
+    return *tbl_leaf_key(table, node, n - 1);
   }
-  void* right_child = get_page(pager,*internal_node_right_child(node));
-  return get_node_max_key(pager, right_child);
+  void* right_child = get_page(table->pager, *internal_node_right_child(node));
+  return get_node_max_key(table, right_child);
 }
 
 void print_constants() {
-  printf("ROW_SIZE: %d\n", ROW_SIZE);
+  Table sample;
+  memset(&sample, 0, sizeof(sample));
+  sample.value_size = CATALOG_VALUE_SIZE;
+  sample.cell_size = LEAF_NODE_KEY_SIZE + CATALOG_VALUE_SIZE;
+  sample.max_cells = LEAF_NODE_SPACE_FOR_CELLS / sample.cell_size;
+  printf("CATALOG_VALUE_SIZE: %zu\n", (size_t)CATALOG_VALUE_SIZE);
   printf("COMMON_NODE_HEADER_SIZE: %d\n", COMMON_NODE_HEADER_SIZE);
   printf("LEAF_NODE_HEADER_SIZE: %d\n", LEAF_NODE_HEADER_SIZE);
-  printf("LEAF_NODE_CELL_SIZE: %d\n", LEAF_NODE_CELL_SIZE);
+  printf("catalog cell_size: %u\n", sample.cell_size);
   printf("LEAF_NODE_SPACE_FOR_CELLS: %d\n", LEAF_NODE_SPACE_FOR_CELLS);
-  printf("LEAF_NODE_MAX_CELLS: %d\n", LEAF_NODE_MAX_CELLS);
+  printf("catalog max_cells: %u\n", sample.max_cells);
 }
 
 void indent(uint32_t level) {
@@ -345,7 +393,8 @@ void indent(uint32_t level) {
   }
 }
 
-void print_tree(Pager* pager, uint32_t page_num, uint32_t indentation_level) {
+void print_tree(Pager* pager, uint32_t page_num, uint32_t indentation_level,
+                uint32_t leaf_cell_size) {
   void* node = get_page(pager, page_num);
   uint32_t num_keys, child;
 
@@ -356,7 +405,7 @@ void print_tree(Pager* pager, uint32_t page_num, uint32_t indentation_level) {
       printf("- leaf (size %d)\n", num_keys);
       for (uint32_t i = 0; i < num_keys; i++) {
         indent(indentation_level + 1);
-        printf("- %d\n", *leaf_node_key(node, i));
+        printf("- %d\n", *leaf_key_sized(node, i, leaf_cell_size));
       }
       break;
     case (NODE_INTERNAL):
@@ -366,28 +415,44 @@ void print_tree(Pager* pager, uint32_t page_num, uint32_t indentation_level) {
       if (num_keys > 0) {
         for (uint32_t i = 0; i < num_keys; i++) {
           child = *internal_node_child(node, i);
-          print_tree(pager, child, indentation_level + 1);
+          print_tree(pager, child, indentation_level + 1, leaf_cell_size);
 
           indent(indentation_level + 1);
           printf("- key %d\n", *internal_node_key(node, i));
         }
         child = *internal_node_right_child(node);
-        print_tree(pager, child, indentation_level + 1);
+        print_tree(pager, child, indentation_level + 1, leaf_cell_size);
       }
       break;
   }
 }
 
-void serialize_row(Row* source, void* destination) {
-  memcpy(destination + ID_OFFSET, &(source->id), ID_SIZE);
-  memcpy(destination + USERNAME_OFFSET, &(source->username), USERNAME_SIZE);
-  memcpy(destination + EMAIL_OFFSET, &(source->email), EMAIL_SIZE);
+void catalog_write_value(uint32_t root_page_key, const char* table_name,
+                         const char* schema_text, void* dest_value) {
+  uint8_t* p = dest_value;
+  memcpy(p, &root_page_key, sizeof(uint32_t));
+  p += sizeof(uint32_t);
+  memset(p, 0, CATALOG_TABLE_NAME_SIZE);
+  strncpy((char*)p, table_name, CATALOG_TABLE_NAME_SIZE - 1);
+  p += CATALOG_TABLE_NAME_SIZE;
+  memset(p, 0, CATALOG_SCHEMA_STORAGE);
+  strncpy((char*)p, schema_text, CATALOG_SCHEMA_STORAGE - 1);
 }
 
-void deserialize_row(void* source, Row* destination) {
-  memcpy(&(destination->id), source + ID_OFFSET, ID_SIZE);
-  memcpy(&(destination->username), source + USERNAME_OFFSET, USERNAME_SIZE);
-  memcpy(&(destination->email), source + EMAIL_OFFSET, EMAIL_SIZE);
+void catalog_read_value(const void* value, uint32_t* root_page_key,
+                        char* table_name_out, char* schema_out,
+                        size_t schema_cap) {
+  const uint8_t* p = value;
+  memcpy(root_page_key, p, sizeof(uint32_t));
+  p += sizeof(uint32_t);
+  memset(table_name_out, 0, MAX_TABLE_NAME_LENGTH + 1);
+  strncpy(table_name_out, (const char*)p, MAX_TABLE_NAME_LENGTH);
+  table_name_out[MAX_TABLE_NAME_LENGTH] = '\0';
+  p += CATALOG_TABLE_NAME_SIZE;
+  if (schema_out != NULL && schema_cap > 0) {
+    memset(schema_out, 0, schema_cap);
+    strncpy(schema_out, (const char*)p, schema_cap - 1);
+  }
 }
 
 void initialize_leaf_node(void* node) {
@@ -423,7 +488,7 @@ Cursor* leaf_node_find(Table* table, uint32_t page_num, uint32_t key) {
   uint32_t one_past_max_index = num_cells;
   while (one_past_max_index != min_index) {
     uint32_t index = (min_index + one_past_max_index) / 2;
-    uint32_t key_at_index = *leaf_node_key(node, index);
+    uint32_t key_at_index = *tbl_leaf_key(table, node, index);
     if (key == key_at_index) {
       cursor->cell_num = index;
       return cursor;
@@ -475,6 +540,9 @@ Cursor* internal_node_find(Table* table, uint32_t page_num, uint32_t key) {
       return leaf_node_find(table, child_num, key);
     case NODE_INTERNAL:
       return internal_node_find(table, child_num, key);
+    default:
+      printf("Corrupt node type.\n");
+      exit(EXIT_FAILURE);
   }
 }
 
@@ -507,7 +575,7 @@ Cursor* table_start(Table* table) {
 void* cursor_value(Cursor* cursor) {
   uint32_t page_num = cursor->page_num;
   void* page = get_page(cursor->table->pager, page_num);
-  return leaf_node_value(page, cursor->cell_num);
+  return tbl_leaf_value(cursor->table, page, cursor->cell_num);
 }
 
 void cursor_advance(Cursor* cursor) {
@@ -579,17 +647,17 @@ bool header_is_valid(const DbFileHeader* header) {
 uint32_t recover_next_root_page_from_master(Pager* pager, uint32_t master_root_page) {
   Table master_table;
   Cursor* cursor;
-  Row row;
   uint32_t max_root = master_root_page;
 
-  master_table.pager = pager;
+  table_init_catalog(&master_table, pager);
   master_table.root_page_num = master_root_page;
 
   cursor = table_start(&master_table);
   while (!cursor->end_of_table) {
-    deserialize_row(cursor_value(cursor), &row);
-    if (strncmp(row.username, MASTER_TAG_PREFIX ":", 2) == 0 && row.id > max_root) {
-      max_root = row.id;
+    void* node = get_page(pager, cursor->page_num);
+    uint32_t k = *tbl_leaf_key(&master_table, node, cursor->cell_num);
+    if (k > max_root) {
+      max_root = k;
     }
     cursor_advance(cursor);
   }
@@ -622,7 +690,6 @@ Table* db_open(const char* filename) {
 
   Table* table = malloc(sizeof(Table));
   table->pager = pager;
-  table->root_page_num = DB_HEADER_MASTER_ROOT_PAGE;
 
   void* header_page = get_page(pager, 0);
   DbFileHeader* header = (DbFileHeader*)header_page;
@@ -665,7 +732,7 @@ Table* db_open(const char* filename) {
 
   pager->master_root_page = header->master_root_page;
   pager->next_root_page = header->next_root_page;
-  table->root_page_num = pager->master_root_page;
+  table_init_catalog(table, pager);
 
   return table;
 }
@@ -750,67 +817,6 @@ void db_close(Table* table) {
   free(table);
 }
 
-MetaCommandResult do_meta_command(InputBuffer* input_buffer, Table* table) {
-  if (strcmp(input_buffer->buffer, ".exit") == 0) {
-    close_input_buffer(input_buffer);
-    db_close(table);
-    exit(EXIT_SUCCESS);
-  } else if (strcmp(input_buffer->buffer, ".btree") == 0) {
-    printf("Tree:\n");
-    print_tree(table->pager, 0, 0);
-    return META_COMMAND_SUCCESS;
-  } else if (strcmp(input_buffer->buffer, ".constants") == 0) {
-    printf("Constants:\n");
-    print_constants();
-    return META_COMMAND_SUCCESS;
-  } else {
-    return META_COMMAND_UNRECOGNIZED_COMMAND;
-  }
-}
-
-PrepareResult prepare_insert(InputBuffer* input_buffer, Statement* statement) {
-  statement->type = STATEMENT_INSERT;
-
-  char* keyword = strtok(input_buffer->buffer, " ");
-  char* id_string = strtok(NULL, " ");
-  char* username = strtok(NULL, " ");
-  char* email = strtok(NULL, " ");
-
-  if (id_string == NULL || username == NULL || email == NULL) {
-    return PREPARE_SYNTAX_ERROR;
-  }
-
-  int id = atoi(id_string);
-  if (id < 0) {
-    return PREPARE_NEGATIVE_ID;
-  }
-  if (strlen(username) > COLUMN_USERNAME_SIZE) {
-    return PREPARE_STRING_TOO_LONG;
-  }
-  if (strlen(email) > COLUMN_EMAIL_SIZE) {
-    return PREPARE_STRING_TOO_LONG;
-  }
-
-  statement->row_to_insert.id = id;
-  strcpy(statement->row_to_insert.username, username);
-  strcpy(statement->row_to_insert.email, email);
-
-  return PREPARE_SUCCESS;
-}
-
-PrepareResult prepare_statement(InputBuffer* input_buffer,
-                                Statement* statement) {
-  if (strncmp(input_buffer->buffer, "insert", 6) == 0) {
-    return prepare_insert(input_buffer, statement);
-  }
-  if (strcmp(input_buffer->buffer, "select") == 0) {
-    statement->type = STATEMENT_SELECT;
-    return PREPARE_SUCCESS;
-  }
-
-  return PREPARE_UNRECOGNIZED_STATEMENT;
-}
-
 /*
 Until we start recycling free pages, new pages will always
 go onto the end of the database file
@@ -855,7 +861,7 @@ void create_new_root(Table* table, uint32_t right_child_page_num) {
   set_node_root(root, true);
   *internal_node_num_keys(root) = 1;
   *internal_node_child(root, 0) = left_child_page_num;
-  uint32_t left_child_max_key = get_node_max_key(table->pager, left_child);
+  uint32_t left_child_max_key = get_node_max_key(table, left_child);
   *internal_node_key(root, 0) = left_child_max_key;
   *internal_node_right_child(root) = right_child_page_num;
   *node_parent(left_child) = table->root_page_num;
@@ -873,7 +879,7 @@ void internal_node_insert(Table* table, uint32_t parent_page_num,
 
   void* parent = get_page(table->pager, parent_page_num);
   void* child = get_page(table->pager, child_page_num);
-  uint32_t child_max_key = get_node_max_key(table->pager, child);
+  uint32_t child_max_key = get_node_max_key(table, child);
   uint32_t index = internal_node_find_child(parent, child_max_key);
 
   uint32_t original_num_keys = *internal_node_num_keys(parent);
@@ -901,11 +907,11 @@ void internal_node_insert(Table* table, uint32_t parent_page_num,
   */
   *internal_node_num_keys(parent) = original_num_keys + 1;
 
-  if (child_max_key > get_node_max_key(table->pager, right_child)) {
+  if (child_max_key > get_node_max_key(table, right_child)) {
     /* Replace right child */
     *internal_node_child(parent, original_num_keys) = right_child_page_num;
     *internal_node_key(parent, original_num_keys) =
-        get_node_max_key(table->pager, right_child);
+        get_node_max_key(table, right_child);
     *internal_node_right_child(parent) = child_page_num;
   } else {
     /* Make room for the new cell */
@@ -928,10 +934,10 @@ void internal_node_split_and_insert(Table* table, uint32_t parent_page_num,
                           uint32_t child_page_num) {
   uint32_t old_page_num = parent_page_num;
   void* old_node = get_page(table->pager,parent_page_num);
-  uint32_t old_max = get_node_max_key(table->pager, old_node);
+  uint32_t old_max = get_node_max_key(table, old_node);
 
   void* child = get_page(table->pager, child_page_num); 
-  uint32_t child_max = get_node_max_key(table->pager, child);
+  uint32_t child_max = get_node_max_key(table, child);
 
   uint32_t new_page_num = get_unused_page_num(table->pager);
 
@@ -1003,14 +1009,14 @@ void internal_node_split_and_insert(Table* table, uint32_t parent_page_num,
   Determine which of the two nodes after the split should contain the child to be inserted,
   and insert the child
   */
-  uint32_t max_after_split = get_node_max_key(table->pager, old_node);
+  uint32_t max_after_split = get_node_max_key(table, old_node);
 
   uint32_t destination_page_num = child_max < max_after_split ? old_page_num : new_page_num;
 
   internal_node_insert(table, destination_page_num, child_page_num);
   *node_parent(child) = destination_page_num;
 
-  update_internal_node_key(parent, old_max, get_node_max_key(table->pager, old_node));
+  update_internal_node_key(parent, old_max, get_node_max_key(table, old_node));
 
   if (!splitting_root) {
     internal_node_insert(table,*node_parent(old_node),new_page_num);
@@ -1018,132 +1024,100 @@ void internal_node_split_and_insert(Table* table, uint32_t parent_page_num,
   }
 }
 
-void leaf_node_split_and_insert(Cursor* cursor, uint32_t key, Row* value) {
-  /*
-  Create a new node and move half the cells over.
-  Insert the new value in one of the two nodes.
-  Update parent or create a new parent.
-  */
+void leaf_node_split_and_insert(Cursor* cursor, uint32_t key,
+                                const void* value) {
+  Table* t = cursor->table;
+  uint32_t max_c = t->max_cells;
+  uint32_t right_split = (max_c + 1) / 2;
+  uint32_t left_split = (max_c + 1) - right_split;
 
-  void* old_node = get_page(cursor->table->pager, cursor->page_num);
-  uint32_t old_max = get_node_max_key(cursor->table->pager, old_node);
-  uint32_t new_page_num = get_unused_page_num(cursor->table->pager);
-  void* new_node = get_page(cursor->table->pager, new_page_num);
+  void* old_node = get_page(t->pager, cursor->page_num);
+  uint32_t old_max = get_node_max_key(t, old_node);
+  uint32_t new_page_num = get_unused_page_num(t->pager);
+  void* new_node = get_page(t->pager, new_page_num);
   initialize_leaf_node(new_node);
   *node_parent(new_node) = *node_parent(old_node);
   *leaf_node_next_leaf(new_node) = *leaf_node_next_leaf(old_node);
   *leaf_node_next_leaf(old_node) = new_page_num;
 
-  /*
-  All existing keys plus new key should should be divided
-  evenly between old (left) and new (right) nodes.
-  Starting from the right, move each key to correct position.
-  */
-  for (int32_t i = LEAF_NODE_MAX_CELLS; i >= 0; i--) {
+  for (int32_t i = (int32_t)max_c; i >= 0; i--) {
     void* destination_node;
-    if (i >= LEAF_NODE_LEFT_SPLIT_COUNT) {
+    if ((uint32_t)i >= left_split) {
       destination_node = new_node;
     } else {
       destination_node = old_node;
     }
-    uint32_t index_within_node = i % LEAF_NODE_LEFT_SPLIT_COUNT;
-    void* destination = leaf_node_cell(destination_node, index_within_node);
+    uint32_t index_within_node = (uint32_t)i % left_split;
+    void* destination = tbl_leaf_cell(t, destination_node, index_within_node);
 
-    if (i == cursor->cell_num) {
-      serialize_row(value,
-                    leaf_node_value(destination_node, index_within_node));
-      *leaf_node_key(destination_node, index_within_node) = key;
-    } else if (i > cursor->cell_num) {
-      memcpy(destination, leaf_node_cell(old_node, i - 1), LEAF_NODE_CELL_SIZE);
+    if ((uint32_t)i == cursor->cell_num) {
+      memcpy(tbl_leaf_value(t, destination_node, index_within_node), value,
+             t->value_size);
+      *tbl_leaf_key(t, destination_node, index_within_node) = key;
+    } else if ((uint32_t)i > cursor->cell_num) {
+      memcpy(destination, tbl_leaf_cell(t, old_node, (uint32_t)i - 1),
+             t->cell_size);
     } else {
-      memcpy(destination, leaf_node_cell(old_node, i), LEAF_NODE_CELL_SIZE);
+      memcpy(destination, tbl_leaf_cell(t, old_node, (uint32_t)i),
+             t->cell_size);
     }
   }
 
-  /* Update cell count on both leaf nodes */
-  *(leaf_node_num_cells(old_node)) = LEAF_NODE_LEFT_SPLIT_COUNT;
-  *(leaf_node_num_cells(new_node)) = LEAF_NODE_RIGHT_SPLIT_COUNT;
+  *(leaf_node_num_cells(old_node)) = left_split;
+  *(leaf_node_num_cells(new_node)) = right_split;
 
   if (is_node_root(old_node)) {
-    return create_new_root(cursor->table, new_page_num);
-  } else {
-    uint32_t parent_page_num = *node_parent(old_node);
-    uint32_t new_max = get_node_max_key(cursor->table->pager, old_node);
-    void* parent = get_page(cursor->table->pager, parent_page_num);
-
-    update_internal_node_key(parent, old_max, new_max);
-    internal_node_insert(cursor->table, parent_page_num, new_page_num);
+    create_new_root(t, new_page_num);
     return;
   }
+  uint32_t parent_page_num = *node_parent(old_node);
+  uint32_t new_max = get_node_max_key(t, old_node);
+  void* parent = get_page(t->pager, parent_page_num);
+
+  update_internal_node_key(parent, old_max, new_max);
+  internal_node_insert(t, parent_page_num, new_page_num);
 }
 
-void leaf_node_insert(Cursor* cursor, uint32_t key, Row* value) {
-  void* node = get_page(cursor->table->pager, cursor->page_num);
+void leaf_node_insert(Cursor* cursor, uint32_t key, const void* value) {
+  Table* t = cursor->table;
+  void* node = get_page(t->pager, cursor->page_num);
 
   uint32_t num_cells = *leaf_node_num_cells(node);
-  if (num_cells >= LEAF_NODE_MAX_CELLS) {
-    // Node full
+  if (num_cells >= t->max_cells) {
     leaf_node_split_and_insert(cursor, key, value);
     return;
   }
 
   if (cursor->cell_num < num_cells) {
-    // Make room for new cell
     for (uint32_t i = num_cells; i > cursor->cell_num; i--) {
-      memcpy(leaf_node_cell(node, i), leaf_node_cell(node, i - 1),
-             LEAF_NODE_CELL_SIZE);
+      memcpy(tbl_leaf_cell(t, node, i), tbl_leaf_cell(t, node, i - 1),
+             t->cell_size);
     }
   }
 
   *(leaf_node_num_cells(node)) += 1;
-  *(leaf_node_key(node, cursor->cell_num)) = key;
-  serialize_row(value, leaf_node_value(node, cursor->cell_num));
+  *tbl_leaf_key(t, node, cursor->cell_num) = key;
+  memcpy(tbl_leaf_value(t, node, cursor->cell_num), value, t->value_size);
 }
 
-ExecuteResult execute_insert(Statement* statement, Table* table) {
-  Row* row_to_insert = &(statement->row_to_insert);
-  uint32_t key_to_insert = row_to_insert->id;
-  Cursor* cursor = table_find(table, key_to_insert);
+ExecuteResult insert_row_into_table(Table* table, uint32_t key,
+                                    const void* value) {
+  Cursor* cursor = table_find(table, key);
 
   void* node = get_page(table->pager, cursor->page_num);
   uint32_t num_cells = *leaf_node_num_cells(node);
 
   if (cursor->cell_num < num_cells) {
-    uint32_t key_at_index = *leaf_node_key(node, cursor->cell_num);
-    if (key_at_index == key_to_insert) {
+    uint32_t key_at_index = *tbl_leaf_key(table, node, cursor->cell_num);
+    if (key_at_index == key) {
+      free(cursor);
       return EXECUTE_DUPLICATE_KEY;
     }
   }
 
-  leaf_node_insert(cursor, row_to_insert->id, row_to_insert);
-
+  leaf_node_insert(cursor, key, value);
   free(cursor);
-
   return EXECUTE_SUCCESS;
-}
-
-ExecuteResult execute_select(Statement* statement, Table* table) {
-  Cursor* cursor = table_start(table);
-
-  Row row;
-  while (!(cursor->end_of_table)) {
-    deserialize_row(cursor_value(cursor), &row);
-    print_row(&row);
-    cursor_advance(cursor);
-  }
-
-  free(cursor);
-
-  return EXECUTE_SUCCESS;
-}
-
-ExecuteResult execute_statement(Statement* statement, Table* table) {
-  switch (statement->type) {
-    case (STATEMENT_INSERT):
-      return execute_insert(statement, table);
-    case (STATEMENT_SELECT):
-      return execute_select(statement, table);
-  }
 }
 
 bool ensure_directory(const char* path) {
@@ -1185,7 +1159,7 @@ bool parse_u32(const char* text, uint32_t* value) {
 }
 
 bool split_schema_payload(const char* payload, SqlSchema* schema) {
-  char temp[COLUMN_EMAIL_SIZE + 1];
+  char temp[SCHEMA_TEXT_MAX + 1];
   char* parts[1 + (MAX_SCHEMA_COLUMNS * 3)];
   int count = 0;
   char* saveptr = NULL;
@@ -1210,46 +1184,31 @@ bool split_schema_payload(const char* payload, SqlSchema* schema) {
     return false;
   }
 
-  if (count == 1 + (int)(schema->column_count * 3)) {
-    for (uint32_t i = 0; i < schema->column_count; i++) {
-      uint32_t parsed_type;
-      uint32_t parsed_max;
-      strncpy(schema->column_names[i], parts[1 + (i * 3)],
-              sizeof(schema->column_names[i]) - 1);
-      schema->column_names[i][sizeof(schema->column_names[i]) - 1] = '\0';
-      if (!parse_u32(parts[2 + (i * 3)], &parsed_type) ||
-          !parse_u32(parts[3 + (i * 3)], &parsed_max)) {
-        return false;
-      }
-      if (parsed_type != COLUMN_TYPE_INT && parsed_type != COLUMN_TYPE_VARCHAR) {
-        return false;
-      }
-      if (parsed_type == COLUMN_TYPE_INT) {
-        parsed_max = 0;
-      }
-      if (parsed_type == COLUMN_TYPE_VARCHAR &&
-          (parsed_max == 0 || parsed_max > MAX_CELL_TEXT)) {
-        return false;
-      }
-      schema->column_type[i] = parsed_type;
-      schema->column_max[i] = parsed_max;
-    }
-  } else if (count == 1 + (int)(schema->column_count * 2)) {
-    /* Backward compatibility: old payload format stored name|max only. */
-    for (uint32_t i = 0; i < schema->column_count; i++) {
-      uint32_t parsed_max;
-      strncpy(schema->column_names[i], parts[1 + (i * 2)],
-              sizeof(schema->column_names[i]) - 1);
-      schema->column_names[i][sizeof(schema->column_names[i]) - 1] = '\0';
-      if (!parse_u32(parts[2 + (i * 2)], &parsed_max) ||
-          parsed_max == 0 || parsed_max > MAX_CELL_TEXT) {
-        return false;
-      }
-      schema->column_type[i] = COLUMN_TYPE_VARCHAR;
-      schema->column_max[i] = parsed_max;
-    }
-  } else {
+  if (count != 1 + (int)(schema->column_count * 3)) {
     return false;
+  }
+  for (uint32_t i = 0; i < schema->column_count; i++) {
+    uint32_t parsed_type;
+    uint32_t parsed_max;
+    strncpy(schema->column_names[i], parts[1 + (i * 3)],
+            sizeof(schema->column_names[i]) - 1);
+    schema->column_names[i][sizeof(schema->column_names[i]) - 1] = '\0';
+    if (!parse_u32(parts[2 + (i * 3)], &parsed_type) ||
+        !parse_u32(parts[3 + (i * 3)], &parsed_max)) {
+      return false;
+    }
+    if (parsed_type != COLUMN_TYPE_INT && parsed_type != COLUMN_TYPE_VARCHAR) {
+      return false;
+    }
+    if (parsed_type == COLUMN_TYPE_INT) {
+      parsed_max = 0;
+    }
+    if (parsed_type == COLUMN_TYPE_VARCHAR &&
+        (parsed_max == 0 || parsed_max > MAX_CELL_TEXT)) {
+      return false;
+    }
+    schema->column_type[i] = parsed_type;
+    schema->column_max[i] = parsed_max;
   }
 
   strncpy(schema->create_sql, payload, sizeof(schema->create_sql) - 1);
@@ -1276,88 +1235,96 @@ bool make_schema_payload(const SqlSchema* schema, char* out, size_t out_size) {
   return true;
 }
 
-bool pack_values_payload(uint32_t value_count,
-                         char values[MAX_SCHEMA_COLUMNS][MAX_CELL_TEXT + 1],
-                         Row* row) {
-  char payload[USERNAME_SIZE + EMAIL_SIZE + 1];
-  size_t used = 0;
+bool pack_insert_row(const SqlStatement* stmt, const SqlSchema* schema,
+                     const RowLayout* L, uint8_t* out) {
+  memset(out, 0, L->value_size);
+  for (uint32_t i = 0; i < schema->column_count; i++) {
+    uint32_t off = L->col_offset[i];
+    uint32_t sz = L->col_size[i];
+    if (schema->column_type[i] == COLUMN_TYPE_INT) {
+      uint32_t v;
+      if (!parse_u32(stmt->values[i], &v)) {
+        return false;
+      }
 
-  payload[0] = '\0';
-  for (uint32_t i = 0; i < value_count; i++) {
-    size_t need = strlen(values[i]) + (i == 0 ? 0 : 1);
-    if (used + need >= sizeof(payload)) {
-      return false;
+      memcpy(out + off, &v, sizeof(uint32_t));
+    } else {
+      const char* s = stmt->values[i];
+      size_t len = strlen(s);
+      if (len > sz) {
+        return false;
+      }
+      memcpy(out + off, s, len);
     }
-    if (i > 0) {
-      payload[used++] = '|';
-      payload[used] = '\0';
-    }
-    strcat(payload, values[i]);
-    used += strlen(values[i]);
-  }
-
-  memset(row->username, 0, sizeof(row->username));
-  memset(row->email, 0, sizeof(row->email));
-  strncpy(row->username, payload, COLUMN_USERNAME_SIZE);
-  if (used > COLUMN_USERNAME_SIZE) {
-    strncpy(row->email, payload + COLUMN_USERNAME_SIZE, COLUMN_EMAIL_SIZE);
   }
   return true;
 }
 
-bool unpack_values_payload(const Row* row,
-                           uint32_t expected_count,
-                           char values[MAX_SCHEMA_COLUMNS][MAX_CELL_TEXT + 1]) {
-  char payload[USERNAME_SIZE + EMAIL_SIZE + 1];
-  char* token;
-  char* saveptr = NULL;
-  uint32_t count = 0;
-
-  memset(payload, 0, sizeof(payload));
-  strncpy(payload, row->username, COLUMN_USERNAME_SIZE);
-  strncpy(payload + COLUMN_USERNAME_SIZE, row->email, COLUMN_EMAIL_SIZE);
-
-  token = strtok_r(payload, "|", &saveptr);
-  while (token != NULL && count < MAX_SCHEMA_COLUMNS) {
-    strncpy(values[count], token, MAX_CELL_TEXT);
-    values[count][MAX_CELL_TEXT] = '\0';
-    count++;
-    token = strtok_r(NULL, "|", &saveptr);
+bool parse_u32_tokens_for_insert(const SqlStatement* stmt,
+                                 const SqlSchema* schema) {
+  for (uint32_t i = 0; i < schema->column_count; i++) {
+    if (schema->column_type[i] == COLUMN_TYPE_INT) {
+      uint32_t v;
+      if (!parse_u32(stmt->values[i], &v)) {
+        printf("Type error: expected int for column %s.\n",
+               schema->column_names[i]);
+        return false;
+      }
+      if (i == 0 && v != stmt->id) {
+        return false;
+      }
+    } else if (schema->column_type[i] == COLUMN_TYPE_VARCHAR) {
+      if (strlen(stmt->values[i]) > schema->column_max[i]) {
+        printf("String is too long.\n");
+        return false;
+      }
+    }
   }
-
-  return count == expected_count;
+  return true;
 }
 
-bool make_master_tag(const char* table_name, char* out, size_t out_size) {
-  int written = snprintf(out, out_size, "%s:%s", MASTER_TAG_PREFIX, table_name);
-  return written >= 0 && (size_t)written < out_size;
+void print_user_row(const void* value, const SqlSchema* s, const RowLayout* L) {
+  const uint8_t* d = value;
+  printf("(");
+  for (uint32_t i = 0; i < s->column_count; i++) {
+    if (i > 0) {
+      printf(", ");
+    }
+    if (s->column_type[i] == COLUMN_TYPE_INT) {
+      uint32_t v;
+      memcpy(&v, d + L->col_offset[i], sizeof(uint32_t));
+      printf("%u", v);
+    } else {
+      printf("%.*s", (int)L->col_size[i], (const char*)(d + L->col_offset[i]));
+    }
+  }
+  printf(")\n");
 }
 
-Table as_table_root(Pager* pager, uint32_t root_page_num) {
-  Table table;
-  table.pager = pager;
-  table.root_page_num = root_page_num;
-  return table;
-}
-
-bool master_find_table(Table* db, const char* table_name, SqlSchema* schema, uint32_t* root_page) {
+bool master_find_table(Table* db, const char* table_name, SqlSchema* schema,
+                       uint32_t* root_page) {
   Cursor* cursor;
-  Row row;
-  char tag[COLUMN_USERNAME_SIZE + 1];
   Table master_table;
+  char name_buf[MAX_TABLE_NAME_LENGTH + 1];
+  char schema_buf[SCHEMA_TEXT_MAX + 1];
 
-  if (!make_master_tag(table_name, tag, sizeof(tag))) {
+  if (!is_valid_identifier(table_name, MAX_TABLE_NAME_LENGTH)) {
     return false;
   }
 
-  master_table = as_table_root(db->pager, db->pager->master_root_page);
+  table_init_catalog(&master_table, db->pager);
+  master_table.root_page_num = db->pager->master_root_page;
   cursor = table_start(&master_table);
   while (!cursor->end_of_table) {
-    deserialize_row(cursor_value(cursor), &row);
-    if (strcmp(row.username, tag) == 0) {
-      bool ok = split_schema_payload(row.email, schema);
+    void* node = get_page(db->pager, cursor->page_num);
+    uint32_t key = *tbl_leaf_key(&master_table, node, cursor->cell_num);
+    uint32_t dummy_root;
+    catalog_read_value(tbl_leaf_value(&master_table, node, cursor->cell_num),
+                       &dummy_root, name_buf, schema_buf, sizeof(schema_buf));
+    if (strcmp(name_buf, table_name) == 0) {
+      bool ok = split_schema_payload(schema_buf, schema);
       if (ok && root_page != NULL) {
-        *root_page = row.id;
+        *root_page = key;
       }
       free(cursor);
       return ok;
@@ -1389,14 +1356,6 @@ bool create_table_root(Table* db, uint32_t root_page) {
   initialize_leaf_node(root_node);
   set_node_root(root_node, true);
   return true;
-}
-
-ExecuteResult insert_row_into_root(Pager* pager, uint32_t root_page, Row* row) {
-  Table table = as_table_root(pager, root_page);
-  Statement statement;
-  statement.type = STATEMENT_INSERT;
-  statement.row_to_insert = *row;
-  return execute_insert(&statement, &table);
 }
 
 int split_tokens_sql(char* input, char* tokens[], int max_tokens) {
@@ -1440,8 +1399,8 @@ int split_tokens_sql(char* input, char* tokens[], int max_tokens) {
 }
 
 bool parse_create_table(char* line, SqlStatement* out) {
-  char raw[COLUMN_EMAIL_SIZE + 1];
-  char copy[COLUMN_EMAIL_SIZE + 1];
+  char raw[SQL_LINE_BUF];
+  char copy[SQL_LINE_BUF];
   char* tokens[64];
   int count;
   int index;
@@ -1473,6 +1432,12 @@ bool parse_create_table(char* line, SqlStatement* out) {
   out->table_name[sizeof(out->table_name) - 1] = '\0';
 
   out->schema.column_count = 0;
+  strncpy(out->schema.column_names[0], "id", sizeof(out->schema.column_names[0]) - 1);
+  out->schema.column_names[0][sizeof(out->schema.column_names[0]) - 1] = '\0';
+  out->schema.column_type[0] = COLUMN_TYPE_INT;
+  out->schema.column_max[0] = 0;
+  out->schema.column_count = 1;
+
   while (index + 1 < count) {
     const char* col_name;
     int advance;
@@ -1523,7 +1488,7 @@ bool parse_create_table(char* line, SqlStatement* out) {
 }
 
 bool parse_insert_into(char* line, SqlStatement* out) {
-  char copy[COLUMN_EMAIL_SIZE + 1];
+  char copy[SQL_LINE_BUF];
   char* tokens[64];
   int count;
   int values_idx = -1;
@@ -1555,7 +1520,9 @@ bool parse_insert_into(char* line, SqlStatement* out) {
     return false;
   }
 
-  out->value_count = 0;
+  strncpy(out->values[0], tokens[values_idx + 1], MAX_CELL_TEXT);
+  out->values[0][MAX_CELL_TEXT] = '\0';
+  out->value_count = 1;
   for (int i = values_idx + 2; i < count; i++) {
     if (out->value_count >= MAX_SCHEMA_COLUMNS) {
       return false;
@@ -1592,7 +1559,7 @@ bool parse_create_database(char* line, SqlStatement* out) {
 }
 
 bool parse_select_from(char* line, SqlStatement* out) {
-  char copy[COLUMN_EMAIL_SIZE + 1];
+  char copy[SQL_LINE_BUF];
   char* tokens[16];
   int count;
 
@@ -1688,15 +1655,21 @@ void list_databases(const char* root_path) {
 
 void show_tables(Table* db) {
   Cursor* cursor;
-  Row row;
-  Table master = as_table_root(db->pager, db->pager->master_root_page);
+  Table master;
+  char name_buf[MAX_TABLE_NAME_LENGTH + 1];
+  char schema_buf[SCHEMA_TEXT_MAX + 1];
+
+  table_init_catalog(&master, db->pager);
+  master.root_page_num = db->pager->master_root_page;
 
   cursor = table_start(&master);
   while (!cursor->end_of_table) {
-    deserialize_row(cursor_value(cursor), &row);
-    if (strncmp(row.username, MASTER_TAG_PREFIX ":", 2) == 0) {
-      printf("%s (root_page=%u)\n", row.username + 2, row.id);
-    }
+    void* node = get_page(db->pager, cursor->page_num);
+    uint32_t rp = *tbl_leaf_key(&master, node, cursor->cell_num);
+    uint32_t dummy;
+    catalog_read_value(tbl_leaf_value(&master, node, cursor->cell_num), &dummy,
+                       name_buf, schema_buf, sizeof(schema_buf));
+    printf("%s (root_page=%u)\n", name_buf, rp);
     cursor_advance(cursor);
   }
   free(cursor);
@@ -1713,136 +1686,237 @@ bool create_database(Session* session, const char* db_name) {
   return ensure_directory(db_dir);
 }
 
-void execute_sql(Session* session, const SqlStatement* stmt) {
+SqlExecuteResult execute_create_database(Session* session,
+                                         const SqlStatement* stmt) {
+  if (!create_database(session, stmt->table_name)) {
+    return SQL_EXEC_CREATE_DB_FAILED;
+  }
+  return SQL_EXEC_OK;
+}
+
+SqlExecuteResult execute_create_table(Table* db, const SqlStatement* stmt) {
+  SqlSchema existing;
+  uint32_t root_page;
+  char schema_payload[SCHEMA_TEXT_MAX + 1];
+  uint8_t catalog_value[CATALOG_VALUE_SIZE];
+  ExecuteResult btree_result;
+  RowLayout layout_check;
+
+  if (strcmp(stmt->table_name, "sqlite_master") == 0) {
+    return SQL_EXEC_RESERVED_TABLE_NAME;
+  }
+  if (master_find_table(db, stmt->table_name, &existing, NULL)) {
+    return SQL_EXEC_TABLE_EXISTS;
+  }
+
+  if (!compute_row_layout(&stmt->schema, &layout_check)) {
+    return SQL_EXEC_ROW_LAYOUT_TOO_LARGE;
+  }
+
+  root_page = allocate_next_root_page(db->pager);
+  create_table_root(db, root_page);
+
+  if (strlen(stmt->table_name) >= CATALOG_TABLE_NAME_SIZE) {
+    return SQL_EXEC_TABLE_NAME_TOO_LONG;
+  }
+  if (!make_schema_payload(&stmt->schema, schema_payload,
+                           sizeof(schema_payload))) {
+    return SQL_EXEC_SCHEMA_METADATA_TOO_LONG;
+  }
+
+  catalog_write_value(root_page, stmt->table_name, schema_payload,
+                      catalog_value);
+
+  btree_result = insert_row_into_table(db, root_page, catalog_value);
+  if (btree_result == EXECUTE_DUPLICATE_KEY) {
+    return SQL_EXEC_DUPLICATE_KEY;
+  }
+  return SQL_EXEC_OK;
+}
+
+SqlExecuteResult execute_insert(Table* db, const SqlStatement* stmt) {
+  SqlSchema schema;
+  uint32_t root_page;
+  ExecuteResult btree_result;
+  Table user_table;
+  uint8_t row_buf[LEAF_NODE_SPACE_FOR_CELLS];
+
+  if (!master_find_table(db, stmt->table_name, &schema, &root_page)) {
+    return SQL_EXEC_TABLE_NOT_FOUND;
+  }
+  if (stmt->value_count != schema.column_count) {
+    printf("Error: Expected %u values.\n", schema.column_count);
+    return SQL_EXEC_WRONG_VALUE_COUNT;
+  }
+
+  if (schema.column_count == 0 || schema.column_type[0] != COLUMN_TYPE_INT) {
+    return SQL_EXEC_SCHEMA_INVALID_PK;
+  }
+  if (!parse_u32_tokens_for_insert(stmt, &schema)) {
+    return SQL_EXEC_INSERT_VALIDATION_FAILED;
+  }
+
+  if (!table_init_user(&user_table, db->pager, root_page, &schema)) {
+    return SQL_EXEC_ROW_LAYOUT_TOO_LARGE;
+  }
+  if (!pack_insert_row(stmt, &schema, &user_table.row_layout, row_buf)) {
+    return SQL_EXEC_ROW_PACK_FAILED;
+  }
+
+  btree_result = insert_row_into_table(&user_table, stmt->id, row_buf);
+  if (btree_result == EXECUTE_DUPLICATE_KEY) {
+    return SQL_EXEC_DUPLICATE_KEY;
+  }
+  return SQL_EXEC_OK;
+}
+
+SqlExecuteResult execute_select(Table* db, const SqlStatement* stmt) {
+  SqlSchema schema;
+  uint32_t root_page;
+  Table target;
+  Cursor* cursor;
+
+  if (!master_find_table(db, stmt->table_name, &schema, &root_page)) {
+    return SQL_EXEC_TABLE_NOT_FOUND;
+  }
+
+  if (!table_init_user(&target, db->pager, root_page, &schema)) {
+    return SQL_EXEC_SELECT_LAYOUT_INVALID;
+  }
+  cursor = table_start(&target);
+  while (!cursor->end_of_table) {
+    print_user_row(cursor_value(cursor), &schema, &target.row_layout);
+    cursor_advance(cursor);
+  }
+  free(cursor);
+  return SQL_EXEC_OK;
+}
+
+SqlExecuteResult execute_statement(Session* session, const SqlStatement* stmt) {
   Table* db = session->database;
 
-  if (stmt->type == SQL_STMT_CREATE_DATABASE) {
-    if (!create_database(session, stmt->table_name)) {
+  switch (stmt->type) {
+    case SQL_STMT_CREATE_DATABASE:
+      return execute_create_database(session, stmt);
+    case SQL_STMT_CREATE_TABLE:
+      return execute_create_table(db, stmt);
+    case SQL_STMT_INSERT:
+      return execute_insert(db, stmt);
+    case SQL_STMT_SELECT:
+      return execute_select(db, stmt);
+  }
+  return SQL_EXEC_OK;
+}
+
+static void print_sql_execute_result(SqlExecuteResult r) {
+  switch (r) {
+    case SQL_EXEC_OK:
+      printf("Executed.\n");
+      break;
+    case SQL_EXEC_CREATE_DB_FAILED:
       printf("Error: Could not create database.\n");
-      return;
-    }
-    printf("Executed.\n");
-    return;
-  }
-
-  if (stmt->type == SQL_STMT_CREATE_TABLE) {
-    SqlSchema existing;
-    uint32_t root_page;
-    Row master_row;
-    char master_tag[COLUMN_USERNAME_SIZE + 1];
-    char schema_payload[COLUMN_EMAIL_SIZE + 1];
-    ExecuteResult result;
-
-    if (strcmp(stmt->table_name, "sqlite_master") == 0) {
+      break;
+    case SQL_EXEC_RESERVED_TABLE_NAME:
       printf("Error: Reserved table name.\n");
-      return;
-    }
-    if (master_find_table(db, stmt->table_name, &existing, NULL)) {
+      break;
+    case SQL_EXEC_TABLE_EXISTS:
       printf("Error: Table already exists.\n");
-      return;
-    }
-
-    root_page = allocate_next_root_page(db->pager);
-    create_table_root(db, root_page);
-
-    if (!make_master_tag(stmt->table_name, master_tag, sizeof(master_tag)) ||
-        !make_schema_payload(&stmt->schema, schema_payload, sizeof(schema_payload))) {
+      break;
+    case SQL_EXEC_ROW_LAYOUT_TOO_LARGE:
+      printf("Error: Row layout too large for one page.\n");
+      break;
+    case SQL_EXEC_TABLE_NAME_TOO_LONG:
+      printf("Error: Table name too long for catalog.\n");
+      break;
+    case SQL_EXEC_SCHEMA_METADATA_TOO_LONG:
       printf("Error: Schema metadata too long.\n");
-      return;
-    }
-
-    memset(&master_row, 0, sizeof(master_row));
-    master_row.id = root_page;
-    strcpy(master_row.username, master_tag);
-    strcpy(master_row.email, schema_payload);
-
-    result = insert_row_into_root(db->pager, db->pager->master_root_page, &master_row);
-    if (result == EXECUTE_DUPLICATE_KEY) {
+      break;
+    case SQL_EXEC_DUPLICATE_KEY:
       printf("Error: Duplicate key.\n");
-      return;
-    }
-    printf("Executed.\n");
-    return;
+      break;
+    case SQL_EXEC_TABLE_NOT_FOUND:
+      printf("Error: Table not found.\n");
+      break;
+    case SQL_EXEC_WRONG_VALUE_COUNT:
+      break;
+    case SQL_EXEC_SCHEMA_INVALID_PK:
+      printf("Error: First column must be int primary key.\n");
+      break;
+    case SQL_EXEC_INSERT_VALIDATION_FAILED:
+      break;
+    case SQL_EXEC_ROW_PACK_FAILED:
+      printf("Error: Row pack failed.\n");
+      break;
+    case SQL_EXEC_SELECT_LAYOUT_INVALID:
+      printf("Error: Invalid table layout.\n");
+      break;
+  }
+}
+
+void execute_sql(Session* session, const SqlStatement* stmt) {
+  SqlExecuteResult r = execute_statement(session, stmt);
+  print_sql_execute_result(r);
+}
+
+MetaCommandResult do_meta_command(Session* session, InputBuffer* input_buffer) {
+  if (strcmp(input_buffer->buffer, ".exit") == 0) {
+    return META_COMMAND_EXIT;
   }
 
-  if (stmt->type == SQL_STMT_INSERT) {
+  if (strncmp(input_buffer->buffer, ".usedatabase ", 13) == 0) {
+    const char* db_name = input_buffer->buffer + 13;
+    if (!switch_database(session, db_name)) {
+      printf("Unable to use database.\n");
+    } else {
+      printf("Using database %s\n", db_name);
+    }
+    return META_COMMAND_SUCCESS;
+  }
+
+  if (strcmp(input_buffer->buffer, ".showdatabases") == 0) {
+    list_databases(session->root_path);
+    return META_COMMAND_SUCCESS;
+  }
+
+  if (strcmp(input_buffer->buffer, ".showtables") == 0) {
+    if (!session->has_active_database || session->database == NULL) {
+      printf("No active database. Use .usedatabase <name>.\n");
+      return META_COMMAND_SUCCESS;
+    }
+    show_tables(session->database);
+    return META_COMMAND_SUCCESS;
+  }
+
+  if (strncmp(input_buffer->buffer, ".btree ", 7) == 0) {
+    const char* table_name = input_buffer->buffer + 7;
     SqlSchema schema;
     uint32_t root_page;
-    ExecuteResult result;
-    Row data_row;
-
-    if (!master_find_table(db, stmt->table_name, &schema, &root_page)) {
+    if (!session->has_active_database || session->database == NULL) {
+      printf("No active database. Use .usedatabase <name>.\n");
+      return META_COMMAND_SUCCESS;
+    }
+    if (!master_find_table(session->database, table_name, &schema, &root_page)) {
       printf("Error: Table not found.\n");
-      return;
+      return META_COMMAND_SUCCESS;
     }
-    if (stmt->value_count != schema.column_count) {
-      printf("Error: Expected %u values.\n", schema.column_count);
-      return;
+    Table layout_table;
+    if (!table_init_user(&layout_table, session->database->pager, root_page,
+                         &schema)) {
+      printf("Error: Invalid table layout.\n");
+      return META_COMMAND_SUCCESS;
     }
-
-    for (uint32_t i = 0; i < schema.column_count; i++) {
-      if (schema.column_type[i] == COLUMN_TYPE_INT) {
-        uint32_t dummy;
-        if (!parse_u32(stmt->values[i], &dummy)) {
-          printf("Type error: expected int for column %s.\n", schema.column_names[i]);
-          return;
-        }
-      } else if (schema.column_type[i] == COLUMN_TYPE_VARCHAR) {
-        if (strlen(stmt->values[i]) > schema.column_max[i]) {
-          printf("String is too long.\n");
-          return;
-        }
-      }
-    }
-
-    memset(&data_row, 0, sizeof(data_row));
-    data_row.id = stmt->id;
-    if (!pack_values_payload(schema.column_count,
-                             (char (*)[MAX_CELL_TEXT + 1])stmt->values,
-                             &data_row)) {
-      printf("Error: Row payload too long.\n");
-      return;
-    }
-
-    result = insert_row_into_root(db->pager, root_page, &data_row);
-    if (result == EXECUTE_DUPLICATE_KEY) {
-      printf("Error: Duplicate key.\n");
-      return;
-    }
-    printf("Executed.\n");
-    return;
+    printf("Tree:\n");
+    print_tree(session->database->pager, root_page, 0, layout_table.cell_size);
+    return META_COMMAND_SUCCESS;
   }
 
-  if (stmt->type == SQL_STMT_SELECT) {
-    SqlSchema schema;
-    uint32_t root_page;
-    Table target;
-    Cursor* cursor;
-    Row row;
-    char values[MAX_SCHEMA_COLUMNS][MAX_CELL_TEXT + 1];
-
-    if (!master_find_table(db, stmt->table_name, &schema, &root_page)) {
-      printf("Error: Table not found.\n");
-      return;
-    }
-
-    target = as_table_root(db->pager, root_page);
-    cursor = table_start(&target);
-    while (!cursor->end_of_table) {
-      deserialize_row(cursor_value(cursor), &row);
-      if (unpack_values_payload(&row, schema.column_count, values)) {
-        printf("(%u", row.id);
-        for (uint32_t i = 0; i < schema.column_count; i++) {
-          printf(", %s", values[i]);
-        }
-        printf(")\n");
-      }
-      cursor_advance(cursor);
-    }
-    free(cursor);
-    printf("Executed.\n");
-    return;
+  if (strcmp(input_buffer->buffer, ".constants") == 0) {
+    printf("Constants:\n");
+    print_constants();
+    return META_COMMAND_SUCCESS;
   }
+
+  return META_COMMAND_UNRECOGNIZED_COMMAND;
 }
 
 int main(int argc, char* argv[]) {
@@ -1866,62 +1940,17 @@ int main(int argc, char* argv[]) {
     read_input(input_buffer);
 
     if (input_buffer->buffer[0] == '.') {
-      if (strcmp(input_buffer->buffer, ".exit") == 0) {
+      MetaCommandResult meta = do_meta_command(&session, input_buffer);
+      if (meta == META_COMMAND_EXIT) {
         close_input_buffer(input_buffer);
         if (session.database != NULL) {
           db_close(session.database);
         }
         exit(EXIT_SUCCESS);
       }
-
-      if (strncmp(input_buffer->buffer, ".usedatabase ", 13) == 0) {
-        const char* db_name = input_buffer->buffer + 13;
-        if (!switch_database(&session, db_name)) {
-          printf("Unable to use database.\n");
-        } else {
-          printf("Using database %s\n", db_name);
-        }
-        continue;
+      if (meta == META_COMMAND_UNRECOGNIZED_COMMAND) {
+        printf("Unrecognized command '%s'\n", input_buffer->buffer);
       }
-
-      if (strcmp(input_buffer->buffer, ".showdatabases") == 0) {
-        list_databases(session.root_path);
-        continue;
-      }
-
-      if (strcmp(input_buffer->buffer, ".showtables") == 0) {
-        if (!session.has_active_database || session.database == NULL) {
-          printf("No active database. Use .usedatabase <name>.\n");
-          continue;
-        }
-        show_tables(session.database);
-        continue;
-      }
-
-      if (strncmp(input_buffer->buffer, ".btree ", 7) == 0) {
-        const char* table_name = input_buffer->buffer + 7;
-        SqlSchema schema;
-        uint32_t root_page;
-        if (!session.has_active_database || session.database == NULL) {
-          printf("No active database. Use .usedatabase <name>.\n");
-          continue;
-        }
-        if (!master_find_table(session.database, table_name, &schema, &root_page)) {
-          printf("Error: Table not found.\n");
-          continue;
-        }
-        printf("Tree:\n");
-        print_tree(session.database->pager, root_page, 0);
-        continue;
-      }
-
-      if (strcmp(input_buffer->buffer, ".constants") == 0) {
-        printf("Constants:\n");
-        print_constants();
-        continue;
-      }
-
-      printf("Unrecognized command '%s'\n", input_buffer->buffer);
       continue;
     }
 
