@@ -1219,8 +1219,8 @@ static void internal_node_remove_child(Table* table, uint32_t parent_page_num,
     }
   } else {
     for (uint32_t i = child_index; i + 1 < num_keys; i++) {
-      memcpy(internal_node_cell(parent, i), internal_node_cell(parent, i + 1),
-             INTERNAL_NODE_CELL_SIZE);
+      memmove(internal_node_cell(parent, i), internal_node_cell(parent, i + 1),
+              INTERNAL_NODE_CELL_SIZE);
     }
     *internal_node_num_keys(parent) = num_keys - 1;
   }
