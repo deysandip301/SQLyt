@@ -50,7 +50,7 @@ class TestSQLytSQLMode(unittest.TestCase):
         result = self.run_script([
             "create database app",
             ".usedatabase app",
-            "create table users (id int primary key, name varchar(20), email varchar(30))",
+            "create table users (id int primary key, name text, email text)",
             "insert into users values (1, alice, a@example.com)",
             "select * from users",
             ".exit",
@@ -73,8 +73,8 @@ class TestSQLytSQLMode(unittest.TestCase):
         result = self.run_script([
             "create database app",
             ".usedatabase app",
-            "create table users (id int primary key, name varchar(3), email varchar(10))",
-            "insert into users values (1, alice, a@example.com)",
+            "create table users (id int primary key, name text, email text)",
+            "insert into users values (1, aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa, a@example.com)",
             ".exit",
         ])
 
@@ -93,8 +93,8 @@ class TestSQLytSQLMode(unittest.TestCase):
         result = self.run_script([
             "create database app",
             ".usedatabase app",
-            "create table users (id int primary key, name varchar(20), email varchar(30))",
-            "create table admins (id int primary key, name varchar(20), email varchar(30))",
+            "create table users (id int primary key, name text, email text)",
+            "create table admins (id int primary key, name text, email text)",
             "insert into users values (1, alice, a@example.com)",
             "insert into users values (1, alice2, a2@example.com)",
             "insert into admins values (1, bob, b@example.com)",
@@ -119,8 +119,8 @@ class TestSQLytSQLMode(unittest.TestCase):
         result = self.run_script([
             "create database app",
             ".usedatabase app",
-            "create table users (id int primary key, name varchar(20), email varchar(30))",
-            "create table admins (id int primary key, name varchar(20), email varchar(30))",
+            "create table users (id int primary key, name text, email text)",
+            "create table admins (id int primary key, name text, email text)",
             ".showtables",
             ".exit",
         ])
@@ -132,13 +132,13 @@ class TestSQLytSQLMode(unittest.TestCase):
         self.run_script([
             "create database app",
             ".usedatabase app",
-            "create table users (id int primary key, name varchar(20), email varchar(30))",
+            "create table users (id int primary key, name text, email text)",
             ".exit",
         ])
 
         result = self.run_script([
             ".usedatabase app",
-            "create table admins (id int primary key, name varchar(20), email varchar(30))",
+            "create table admins (id int primary key, name text, email text)",
             ".showtables",
             ".exit",
         ])
@@ -150,8 +150,8 @@ class TestSQLytSQLMode(unittest.TestCase):
         self.run_script([
             "create database app",
             ".usedatabase app",
-            "create table users (id int primary key, name varchar(20), email varchar(30))",
-            "create table admins (id int primary key, name varchar(20), email varchar(30))",
+            "create table users (id int primary key, name text, email text)",
+            "create table admins (id int primary key, name text, email text)",
             ".exit",
         ])
 
@@ -162,7 +162,7 @@ class TestSQLytSQLMode(unittest.TestCase):
 
         result = self.run_script([
             ".usedatabase app",
-            "create table audit (id int primary key, name varchar(20), email varchar(30))",
+            "create table audit (id int primary key, name text, email text)",
             ".showtables",
             ".exit",
         ])
@@ -203,7 +203,7 @@ class TestSQLytSQLMode(unittest.TestCase):
         result = self.run_script([
             "create database app",
             ".usedatabase app",
-            "create table profile (id int primary key, name varchar(20), email varchar(30), city varchar(20), role varchar(15))",
+            "create table profile (id int primary key, name text, email text, city text, role text)",
             "insert into profile values (1, alice, a@example.com, berlin, engineer)",
             "select * from profile",
             ".exit",
@@ -226,7 +226,7 @@ class TestSQLytSQLMode(unittest.TestCase):
         result = self.run_script([
             "create database app",
             ".usedatabase app",
-            "create table user (id int primary key, user_id int, user_name varchar(20), email varchar(30), password varchar(20))",
+            "create table user (id int primary key, user_id int, user_name text, email text, password text)",
             "insert into user values (1, 101, alice, a@example.com, secret)",
             "select * from user",
             ".exit",
@@ -272,7 +272,7 @@ class TestSQLytSQLMode(unittest.TestCase):
         result = self.run_script([
             "create database app",
             ".usedatabase app",
-            "create table people (id int primary key, user_name varchar(30), city varchar(30))",
+            "create table people (id int primary key, user_name text, city text)",
             'insert into people values (1, "Alice Doe", "New York")',
             "select * from people",
             ".exit",
@@ -296,7 +296,7 @@ class TestSQLytSQLMode(unittest.TestCase):
         commands = [
             "create database app",
             ".usedatabase app",
-            f"create table {table} (id int primary key, name varchar(20))",
+            f"create table {table} (id int primary key, name text)",
         ]
         for i in range(1, 14):
             commands.append(f"insert into {table} values ({i}, row{i})")

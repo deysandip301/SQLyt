@@ -70,15 +70,15 @@ create database app
 
 2. Create a table
 - first column must be `id int` (optionally `primary key`)
-- remaining columns can be `int` or `varchar(n)`
+- remaining columns can be `int` or `text`
 
 ```sql
 create table user (
   id int primary key,
   user_id int,
-  user_name varchar(20),
-  email varchar(30),
-  city varchar(20)
+  user_name text,
+  email text,
+  city text
 )
 ```
 
@@ -103,7 +103,7 @@ select * from user
 create database app
 .usedatabase app
 
-create table user (id int primary key, user_id int, user_name varchar(20), email varchar(30))
+create table user (id int primary key, user_id int, user_name text, email text)
 insert into user values (1, 101, "Alice Doe", "alice@example.com")
 insert into user values (2, 102, "Bob", "bob@example.com")
 

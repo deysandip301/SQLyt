@@ -34,7 +34,7 @@ typedef enum {
 #define MAX_COLUMN_NAME_LENGTH 24
 #define MAX_CELL_TEXT 64
 #define COLUMN_TYPE_INT 1
-#define COLUMN_TYPE_VARCHAR 2
+#define COLUMN_TYPE_TEXT 2
 #define DB_HEADER_MAGIC "SQLYTDB1"
 #define DB_FORMAT_VERSION 2
 #define DB_HEADER_MASTER_ROOT_PAGE 1
@@ -76,7 +76,7 @@ typedef struct {
   char table_name[MAX_TABLE_NAME_LENGTH + 1];
   uint32_t id;
   uint32_t value_count;
-  char values[MAX_SCHEMA_COLUMNS][MAX_CELL_TEXT + 1];
+  char values[MAX_SCHEMA_COLUMNS][256];
   SqlSchema schema;
 } SqlStatement;
 
@@ -1425,13 +1425,13 @@ bool split_schema_payload(const char* payload, SqlSchema* schema) {
         !parse_u32(parts[3 + (i * 3)], &parsed_max)) {
       return false;
     }
-    if (parsed_type != COLUMN_TYPE_INT && parsed_type != COLUMN_TYPE_VARCHAR) {
+    if (parsed_type != COLUMN_TYPE_INT && parsed_type != COLUMN_TYPE_TEXT) {
       return false;
     }
     if (parsed_type == COLUMN_TYPE_INT) {
       parsed_max = 0;
     }
-    if (parsed_type == COLUMN_TYPE_VARCHAR &&
+    if (parsed_type == COLUMN_TYPE_TEXT &&
         (parsed_max == 0 || parsed_max > MAX_CELL_TEXT)) {
       return false;
     }
@@ -1501,7 +1501,7 @@ bool parse_u32_tokens_for_insert(const SqlStatement* stmt,
       if (i == 0 && v != stmt->id) {
         return false;
       }
-    } else if (schema->column_type[i] == COLUMN_TYPE_VARCHAR) {
+    } else if (schema->column_type[i] == COLUMN_TYPE_TEXT) {
       if (strlen(stmt->values[i]) > schema->column_max[i]) {
         printf("String is too long.\n");
         return false;
@@ -1685,15 +1685,10 @@ bool parse_create_table(char* line, SqlStatement* out) {
       max_len = 0;
       out->schema.column_type[out->schema.column_count] = COLUMN_TYPE_INT;
       advance = 2;
-    } else if (strcmp(tokens[index + 1], "varchar") == 0) {
-      if (index + 2 >= count) {
-        return false;
-      }
-      if (!parse_u32(tokens[index + 2], &max_len) || max_len == 0 || max_len > MAX_CELL_TEXT) {
-        return false;
-      }
-      out->schema.column_type[out->schema.column_count] = COLUMN_TYPE_VARCHAR;
-      advance = 3;
+    } else if (strcmp(tokens[index + 1], "text") == 0) {
+      max_len = MAX_CELL_TEXT;
+      out->schema.column_type[out->schema.column_count] = COLUMN_TYPE_TEXT;
+      advance = 2;
     } else {
       return false;
     }
@@ -1750,15 +1745,15 @@ bool parse_insert_into(char* line, SqlStatement* out) {
     return false;
   }
 
-  strncpy(out->values[0], tokens[values_idx + 1], MAX_CELL_TEXT);
-  out->values[0][MAX_CELL_TEXT] = '\0';
+  strncpy(out->values[0], tokens[values_idx + 1], 255);
+  out->values[0][255] = '\0';
   out->value_count = 1;
   for (int i = values_idx + 2; i < count; i++) {
     if (out->value_count >= MAX_SCHEMA_COLUMNS) {
       return false;
     }
-    strncpy(out->values[out->value_count], tokens[i], MAX_CELL_TEXT);
-    out->values[out->value_count][MAX_CELL_TEXT] = '\0';
+    strncpy(out->values[out->value_count], tokens[i], 255);
+    out->values[out->value_count][255] = '\0';
     out->value_count += 1;
   }
 
