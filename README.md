@@ -70,15 +70,16 @@ create database app
 
 2. Create a table
 - first column must be `id int` (optionally `primary key`)
-- remaining columns can be `int` or `varchar(n)`
+- remaining columns can be `int` or `text`
+- `text` values are capped at **64 characters**; longer strings will be rejected
 
 ```sql
 create table user (
   id int primary key,
   user_id int,
-  user_name varchar(20),
-  email varchar(30),
-  city varchar(20)
+  user_name text,
+  email text,
+  city text
 )
 ```
 
@@ -97,17 +98,32 @@ insert into user values (1, 101, "Alice Doe", "alice@example.com", "New York")
 select * from user
 ```
 
+5. Delete a row
+
+```sql
+delete from user where id = 1
+```
+
+```sql
+select * from user
+```
+
 ## Quick Session Example
 
 ```text
 create database app
 .usedatabase app
 
-create table user (id int primary key, user_id int, user_name varchar(20), email varchar(30))
+create table user (id int primary key, user_id int, user_name text, email text)
 insert into user values (1, 101, "Alice Doe", "alice@example.com")
 insert into user values (2, 102, "Bob", "bob@example.com")
 
 select * from user
+
+delete from user where id = 1
+
+select * from user
+
 .showtables
 .btree user
 .exit

@@ -50,7 +50,7 @@ class TestSQLytSQLMode(unittest.TestCase):
         result = self.run_script([
             "create database app",
             ".usedatabase app",
-            "create table users (id int primary key, name varchar(20), email varchar(30))",
+            "create table users (id int primary key, name text, email text)",
             "insert into users values (1, alice, a@example.com)",
             "select * from users",
             ".exit",
@@ -69,12 +69,12 @@ class TestSQLytSQLMode(unittest.TestCase):
             ],
         )
 
-    def test_fixed_varchar_enforced(self):
+    def test_max_text_length_enforced(self):
         result = self.run_script([
             "create database app",
             ".usedatabase app",
-            "create table users (id int primary key, name varchar(3), email varchar(10))",
-            "insert into users values (1, alice, a@example.com)",
+            "create table users (id int primary key, name text, email text)",
+            "insert into users values (1, aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa, a@example.com)",
             ".exit",
         ])
 
@@ -93,8 +93,8 @@ class TestSQLytSQLMode(unittest.TestCase):
         result = self.run_script([
             "create database app",
             ".usedatabase app",
-            "create table users (id int primary key, name varchar(20), email varchar(30))",
-            "create table admins (id int primary key, name varchar(20), email varchar(30))",
+            "create table users (id int primary key, name text, email text)",
+            "create table admins (id int primary key, name text, email text)",
             "insert into users values (1, alice, a@example.com)",
             "insert into users values (1, alice2, a2@example.com)",
             "insert into admins values (1, bob, b@example.com)",
@@ -119,8 +119,8 @@ class TestSQLytSQLMode(unittest.TestCase):
         result = self.run_script([
             "create database app",
             ".usedatabase app",
-            "create table users (id int primary key, name varchar(20), email varchar(30))",
-            "create table admins (id int primary key, name varchar(20), email varchar(30))",
+            "create table users (id int primary key, name text, email text)",
+            "create table admins (id int primary key, name text, email text)",
             ".showtables",
             ".exit",
         ])
@@ -132,13 +132,13 @@ class TestSQLytSQLMode(unittest.TestCase):
         self.run_script([
             "create database app",
             ".usedatabase app",
-            "create table users (id int primary key, name varchar(20), email varchar(30))",
+            "create table users (id int primary key, name text, email text)",
             ".exit",
         ])
 
         result = self.run_script([
             ".usedatabase app",
-            "create table admins (id int primary key, name varchar(20), email varchar(30))",
+            "create table admins (id int primary key, name text, email text)",
             ".showtables",
             ".exit",
         ])
@@ -150,8 +150,8 @@ class TestSQLytSQLMode(unittest.TestCase):
         self.run_script([
             "create database app",
             ".usedatabase app",
-            "create table users (id int primary key, name varchar(20), email varchar(30))",
-            "create table admins (id int primary key, name varchar(20), email varchar(30))",
+            "create table users (id int primary key, name text, email text)",
+            "create table admins (id int primary key, name text, email text)",
             ".exit",
         ])
 
@@ -162,7 +162,7 @@ class TestSQLytSQLMode(unittest.TestCase):
 
         result = self.run_script([
             ".usedatabase app",
-            "create table audit (id int primary key, name varchar(20), email varchar(30))",
+            "create table audit (id int primary key, name text, email text)",
             ".showtables",
             ".exit",
         ])
@@ -203,7 +203,7 @@ class TestSQLytSQLMode(unittest.TestCase):
         result = self.run_script([
             "create database app",
             ".usedatabase app",
-            "create table profile (id int primary key, name varchar(20), email varchar(30), city varchar(20), role varchar(15))",
+            "create table profile (id int primary key, name text, email text, city text, role text)",
             "insert into profile values (1, alice, a@example.com, berlin, engineer)",
             "select * from profile",
             ".exit",
@@ -222,11 +222,11 @@ class TestSQLytSQLMode(unittest.TestCase):
             ],
         )
 
-    def test_supports_int_and_varchar_mixed_columns(self):
+    def test_supports_int_and_text_mixed_columns(self):
         result = self.run_script([
             "create database app",
             ".usedatabase app",
-            "create table user (id int primary key, user_id int, user_name varchar(20), email varchar(30), password varchar(20))",
+            "create table user (id int primary key, user_id int, user_name text, email text, password text)",
             "insert into user values (1, 101, alice, a@example.com, secret)",
             "select * from user",
             ".exit",
@@ -272,7 +272,7 @@ class TestSQLytSQLMode(unittest.TestCase):
         result = self.run_script([
             "create database app",
             ".usedatabase app",
-            "create table people (id int primary key, user_name varchar(30), city varchar(30))",
+            "create table people (id int primary key, user_name text, city text)",
             'insert into people values (1, "Alice Doe", "New York")',
             "select * from people",
             ".exit",
@@ -291,12 +291,64 @@ class TestSQLytSQLMode(unittest.TestCase):
             ],
         )
 
+    def test_delete_record(self):
+        result = self.run_script([
+            "create database app",
+            ".usedatabase app",
+            "create table items (id int primary key, data text)",
+            "insert into items values (1, foo)",
+            "insert into items values (2, bar)",
+            "insert into items values (3, baz)",
+            "delete from items where id = 2",
+            "select * from items",
+            ".exit",
+        ])
+
+        self.assertEqual(
+            result,
+            [
+                "db > Executed.",
+                "db > Using database app",
+                "db > Executed.",
+                "db > Executed.",
+                "db > Executed.",
+                "db > Executed.",
+                "db > Executed.",
+                "db > (1, foo)",
+                "(3, baz)",
+                "Executed.",
+                "db > ",
+            ],
+        )
+
+    def test_delete_record_not_found(self):
+        result = self.run_script([
+            "create database app",
+            ".usedatabase app",
+            "create table items (id int primary key, data text)",
+            "insert into items values (1, foo)",
+            "delete from items where id = 2",
+            ".exit",
+        ])
+
+        self.assertEqual(
+            result,
+            [
+                "db > Executed.",
+                "db > Using database app",
+                "db > Executed.",
+                "db > Executed.",
+                "db > Error: Record not found to delete.",
+                "db > ",
+            ],
+        )
+
     def test_btree_node_split_when(self):
         table = "bigtree"
         commands = [
             "create database app",
             ".usedatabase app",
-            f"create table {table} (id int primary key, name varchar(20))",
+            f"create table {table} (id int primary key, name text)",
         ]
         for i in range(1, 14):
             commands.append(f"insert into {table} values ({i}, row{i})")

@@ -34,7 +34,7 @@ typedef enum {
 #define MAX_COLUMN_NAME_LENGTH 24
 #define MAX_CELL_TEXT 64
 #define COLUMN_TYPE_INT 1
-#define COLUMN_TYPE_VARCHAR 2
+#define COLUMN_TYPE_TEXT 2
 #define DB_HEADER_MAGIC "SQLYTDB1"
 #define DB_FORMAT_VERSION 2
 #define DB_HEADER_MASTER_ROOT_PAGE 1
@@ -66,7 +66,8 @@ typedef enum {
   SQL_STMT_CREATE_DATABASE,
   SQL_STMT_CREATE_TABLE,
   SQL_STMT_INSERT,
-  SQL_STMT_SELECT
+  SQL_STMT_SELECT,
+  SQL_STMT_DELETE
 } SqlStatementType;
 
 typedef struct Table Table;
@@ -76,7 +77,7 @@ typedef struct {
   char table_name[MAX_TABLE_NAME_LENGTH + 1];
   uint32_t id;
   uint32_t value_count;
-  char values[MAX_SCHEMA_COLUMNS][MAX_CELL_TEXT + 1];
+  char values[MAX_SCHEMA_COLUMNS][256];
   SqlSchema schema;
 } SqlStatement;
 
@@ -95,6 +96,7 @@ typedef enum {
   SQL_EXEC_INSERT_VALIDATION_FAILED,
   SQL_EXEC_ROW_PACK_FAILED,
   SQL_EXEC_SELECT_LAYOUT_INVALID,
+  SQL_EXEC_DELETE_RECORD_NOT_FOUND,
 } SqlExecuteResult;
 
 typedef struct {
@@ -411,6 +413,9 @@ void* get_page(Pager* pager, uint32_t page_num) {
 uint32_t get_node_max_key(Table* table, void* node) {
   if (get_node_type(node) == NODE_LEAF) {
     uint32_t n = *leaf_node_num_cells(node);
+    if (n == 0) {
+      return 0;
+    }
     return *tbl_leaf_key(table, node, n - 1);
   }
   void* right_child = get_page(table->pager, *internal_node_right_child(node));
@@ -1305,6 +1310,22 @@ void leaf_node_split_and_insert(Cursor* cursor, uint32_t key,
   internal_node_insert(t, parent_page_num, new_page_num);
 }
 
+void leaf_node_delete(Cursor* cursor) {
+  uint32_t page_num = cursor->page_num;
+  void* node = get_page(cursor->table->pager, page_num);
+  uint32_t num_cells = *leaf_node_num_cells(node);
+
+  if (cursor->cell_num < num_cells - 1) {
+    void* dest = tbl_leaf_cell(cursor->table, node, cursor->cell_num);
+    void* src = tbl_leaf_cell(cursor->table, node, cursor->cell_num + 1);
+    size_t bytes_to_move = (num_cells - cursor->cell_num - 1) * cursor->table->cell_size;
+    memmove(dest, src, bytes_to_move);
+  }
+
+  *leaf_node_num_cells(node) -= 1;
+  mark_page_dirty(cursor->table->pager, page_num);
+}
+
 void leaf_node_insert(Cursor* cursor, uint32_t key, const void* value) {
   mark_page_dirty(cursor->table->pager, cursor->page_num);
   Table* t = cursor->table;
@@ -1425,13 +1446,13 @@ bool split_schema_payload(const char* payload, SqlSchema* schema) {
         !parse_u32(parts[3 + (i * 3)], &parsed_max)) {
       return false;
     }
-    if (parsed_type != COLUMN_TYPE_INT && parsed_type != COLUMN_TYPE_VARCHAR) {
+    if (parsed_type != COLUMN_TYPE_INT && parsed_type != COLUMN_TYPE_TEXT) {
       return false;
     }
     if (parsed_type == COLUMN_TYPE_INT) {
       parsed_max = 0;
     }
-    if (parsed_type == COLUMN_TYPE_VARCHAR &&
+    if (parsed_type == COLUMN_TYPE_TEXT &&
         (parsed_max == 0 || parsed_max > MAX_CELL_TEXT)) {
       return false;
     }
@@ -1501,7 +1522,7 @@ bool parse_u32_tokens_for_insert(const SqlStatement* stmt,
       if (i == 0 && v != stmt->id) {
         return false;
       }
-    } else if (schema->column_type[i] == COLUMN_TYPE_VARCHAR) {
+    } else if (schema->column_type[i] == COLUMN_TYPE_TEXT) {
       if (strlen(stmt->values[i]) > schema->column_max[i]) {
         printf("String is too long.\n");
         return false;
@@ -1685,15 +1706,10 @@ bool parse_create_table(char* line, SqlStatement* out) {
       max_len = 0;
       out->schema.column_type[out->schema.column_count] = COLUMN_TYPE_INT;
       advance = 2;
-    } else if (strcmp(tokens[index + 1], "varchar") == 0) {
-      if (index + 2 >= count) {
-        return false;
-      }
-      if (!parse_u32(tokens[index + 2], &max_len) || max_len == 0 || max_len > MAX_CELL_TEXT) {
-        return false;
-      }
-      out->schema.column_type[out->schema.column_count] = COLUMN_TYPE_VARCHAR;
-      advance = 3;
+    } else if (strcmp(tokens[index + 1], "text") == 0) {
+      max_len = MAX_CELL_TEXT;
+      out->schema.column_type[out->schema.column_count] = COLUMN_TYPE_TEXT;
+      advance = 2;
     } else {
       return false;
     }
@@ -1750,15 +1766,15 @@ bool parse_insert_into(char* line, SqlStatement* out) {
     return false;
   }
 
-  strncpy(out->values[0], tokens[values_idx + 1], MAX_CELL_TEXT);
-  out->values[0][MAX_CELL_TEXT] = '\0';
+  strncpy(out->values[0], tokens[values_idx + 1], 255);
+  out->values[0][255] = '\0';
   out->value_count = 1;
   for (int i = values_idx + 2; i < count; i++) {
     if (out->value_count >= MAX_SCHEMA_COLUMNS) {
       return false;
     }
-    strncpy(out->values[out->value_count], tokens[i], MAX_CELL_TEXT);
-    out->values[out->value_count][MAX_CELL_TEXT] = '\0';
+    strncpy(out->values[out->value_count], tokens[i], 255);
+    out->values[out->value_count][255] = '\0';
     out->value_count += 1;
   }
 
@@ -1811,6 +1827,42 @@ bool parse_select_from(char* line, SqlStatement* out) {
   return true;
 }
 
+bool parse_delete_from(char* line, SqlStatement* out) {
+  char copy[SQL_LINE_BUF];
+  char* tokens[16];
+  int count;
+
+  strncpy(copy, line, sizeof(copy) - 1);
+  copy[sizeof(copy) - 1] = '\0';
+  
+  for (int i = 0; copy[i] != '\0'; i++) {
+    if (copy[i] == '=') {
+      copy[i] = ' ';
+    }
+  }
+  
+  count = split_tokens_sql(copy, tokens, 16);
+
+  // e.g. "delete from user where id = 1" becomes tokens ["delete", "from", "user", "where", "id", "1"]
+  if (count != 6 || strcmp(tokens[0], "delete") != 0 || strcmp(tokens[1], "from") != 0 ||
+      strcmp(tokens[3], "where") != 0 || strcmp(tokens[4], "id") != 0) {
+    return false;
+  }
+  if (!is_valid_identifier(tokens[2], MAX_TABLE_NAME_LENGTH)) {
+    return false;
+  }
+
+  strncpy(out->table_name, tokens[2], sizeof(out->table_name) - 1);
+  out->table_name[sizeof(out->table_name) - 1] = '\0';
+  
+  if (!parse_u32(tokens[5], &out->id)) {
+    return false;
+  }
+
+  out->type = SQL_STMT_DELETE;
+  return true;
+}
+
 bool parse_sql_statement(char* line, SqlStatement* out) {
   if (strncmp(line, "create database", 15) == 0) {
     return parse_create_database(line, out);
@@ -1823,6 +1875,9 @@ bool parse_sql_statement(char* line, SqlStatement* out) {
   }
   if (strncmp(line, "select * from", 13) == 0) {
     return parse_select_from(line, out);
+  }
+  if (strncmp(line, "delete from", 11) == 0) {
+    return parse_delete_from(line, out);
   }
   return false;
 }
@@ -2022,6 +2077,36 @@ SqlExecuteResult execute_select(Table* db, const SqlStatement* stmt) {
   return SQL_EXEC_OK;
 }
 
+SqlExecuteResult execute_delete(Table* db, const SqlStatement* stmt) {
+  SqlSchema schema;
+  uint32_t root_page;
+  Table target;
+
+  if (!master_find_table(db, stmt->table_name, &schema, &root_page)) {
+    return SQL_EXEC_TABLE_NOT_FOUND;
+  }
+
+  if (!table_init_user(&target, db->pager, root_page, &schema)) {
+    return SQL_EXEC_SELECT_LAYOUT_INVALID;
+  }
+
+  Cursor* cursor = table_find(&target, stmt->id);
+  void* page = get_page(target.pager, cursor->page_num);
+  uint32_t num_cells = *leaf_node_num_cells(page);
+
+  if (cursor->cell_num < num_cells) {
+    uint32_t key_at_index = *tbl_leaf_key(&target, page, cursor->cell_num);
+    if (key_at_index == stmt->id) {
+       leaf_node_delete(cursor);
+       free(cursor);
+       return SQL_EXEC_OK;
+    }
+  }
+
+  free(cursor);
+  return SQL_EXEC_DELETE_RECORD_NOT_FOUND;
+}
+
 SqlExecuteResult execute_statement(Session* session, const SqlStatement* stmt) {
   Table* db = session->database;
 
@@ -2034,6 +2119,8 @@ SqlExecuteResult execute_statement(Session* session, const SqlStatement* stmt) {
       return execute_insert(db, stmt);
     case SQL_STMT_SELECT:
       return execute_select(db, stmt);
+    case SQL_STMT_DELETE:
+      return execute_delete(db, stmt);
   }
   return SQL_EXEC_OK;
 }
@@ -2080,6 +2167,9 @@ static void print_sql_execute_result(SqlExecuteResult r) {
     case SQL_EXEC_SELECT_LAYOUT_INVALID:
       printf("Error: Invalid table layout.\n");
       break;
+    case SQL_EXEC_DELETE_RECORD_NOT_FOUND:
+      printf("Error: Record not found to delete.\n");
+      break;
   }
 }
 
@@ -2087,7 +2177,7 @@ void execute_sql(Session* session, const SqlStatement* stmt) {
   SqlExecuteResult r = execute_statement(session, stmt);
   print_sql_execute_result(r);
   
-  if (r == SQL_EXEC_OK && (stmt->type == SQL_STMT_INSERT || stmt->type == SQL_STMT_CREATE_TABLE || stmt->type == SQL_STMT_CREATE_DATABASE)) {
+  if (r == SQL_EXEC_OK && (stmt->type == SQL_STMT_INSERT || stmt->type == SQL_STMT_CREATE_TABLE || stmt->type == SQL_STMT_CREATE_DATABASE || stmt->type == SQL_STMT_DELETE)) {
     if (session->database && session->database->pager) {
       pager_commit_transaction_sync(session->database->pager);
     }
