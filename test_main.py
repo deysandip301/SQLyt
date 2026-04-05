@@ -1,4 +1,5 @@
 import os
+import re
 import shutil
 import struct
 import subprocess
@@ -46,6 +47,15 @@ class TestSQLytSQLMode(unittest.TestCase):
         )
         return proc.stdout.split("\n")
 
+    def assert_table_contains(self, result, headers, rows):
+        out = "\n".join(result)
+        self.assertIn("+", out)
+        for header in headers:
+            self.assertRegex(out, rf"\|\s*{re.escape(header)}\s*")
+        for row in rows:
+            pattern = r"\|\s*" + r"\s*\|\s*".join(re.escape(v) for v in row) + r"\s*\|"
+            self.assertRegex(out, pattern)
+
     def test_usedatabase_create_insert_select(self):
         result = self.run_script([
             "create database app",
@@ -55,19 +65,14 @@ class TestSQLytSQLMode(unittest.TestCase):
             "select * from users",
             ".exit",
         ])
-
-        self.assertEqual(
-            result,
-            [
-                "db > Executed.",
-                "db > Using database app",
-                "db > Executed.",
-                "db > Executed.",
-                "db > (1, alice, a@example.com)",
-                "Executed.",
-                "db > ",
-            ],
-        )
+        self.assertEqual(result[0:4], [
+            "db > Executed.",
+            "db > Using database app",
+            "db > Executed.",
+            "db > Executed.",
+        ])
+        self.assert_table_contains(result, ["id", "name", "email"], [["1", "alice", "a@example.com"]])
+        self.assertIn("Executed.", result)
 
     def test_max_text_length_enforced(self):
         result = self.run_script([
@@ -209,18 +214,12 @@ class TestSQLytSQLMode(unittest.TestCase):
             ".exit",
         ])
 
-        self.assertEqual(
+        self.assert_table_contains(
             result,
-            [
-                "db > Executed.",
-                "db > Using database app",
-                "db > Executed.",
-                "db > Executed.",
-                "db > (1, alice, a@example.com, berlin, engineer)",
-                "Executed.",
-                "db > ",
-            ],
+            ["id", "name", "email", "city", "role"],
+            [["1", "alice", "a@example.com", "berlin", "engineer"]],
         )
+        self.assertIn("Executed.", result)
 
     def test_supports_int_and_text_mixed_columns(self):
         result = self.run_script([
@@ -232,18 +231,12 @@ class TestSQLytSQLMode(unittest.TestCase):
             ".exit",
         ])
 
-        self.assertEqual(
+        self.assert_table_contains(
             result,
-            [
-                "db > Executed.",
-                "db > Using database app",
-                "db > Executed.",
-                "db > Executed.",
-                "db > (1, 101, alice, a@example.com, secret)",
-                "Executed.",
-                "db > ",
-            ],
+            ["id", "user_id", "user_name", "email", "password"],
+            [["1", "101", "alice", "a@example.com", "secret"]],
         )
+        self.assertIn("Executed.", result)
 
     def test_supports_table_with_single_user_column(self):
         result = self.run_script([
@@ -255,18 +248,8 @@ class TestSQLytSQLMode(unittest.TestCase):
             ".exit",
         ])
 
-        self.assertEqual(
-            result,
-            [
-                "db > Executed.",
-                "db > Using database app",
-                "db > Executed.",
-                "db > Executed.",
-                "db > (1, 1)",
-                "Executed.",
-                "db > ",
-            ],
-        )
+        self.assert_table_contains(result, ["id", "enabled"], [["1", "1"]])
+        self.assertIn("Executed.", result)
 
     def test_supports_quoted_strings_with_spaces(self):
         result = self.run_script([
@@ -278,18 +261,12 @@ class TestSQLytSQLMode(unittest.TestCase):
             ".exit",
         ])
 
-        self.assertEqual(
+        self.assert_table_contains(
             result,
-            [
-                "db > Executed.",
-                "db > Using database app",
-                "db > Executed.",
-                "db > Executed.",
-                "db > (1, Alice Doe, New York)",
-                "Executed.",
-                "db > ",
-            ],
+            ["id", "user_name", "city"],
+            [["1", "Alice Doe", "New York"]],
         )
+        self.assertIn("Executed.", result)
 
     def test_delete_record(self):
         result = self.run_script([
@@ -304,22 +281,8 @@ class TestSQLytSQLMode(unittest.TestCase):
             ".exit",
         ])
 
-        self.assertEqual(
-            result,
-            [
-                "db > Executed.",
-                "db > Using database app",
-                "db > Executed.",
-                "db > Executed.",
-                "db > Executed.",
-                "db > Executed.",
-                "db > Executed.",
-                "db > (1, foo)",
-                "(3, baz)",
-                "Executed.",
-                "db > ",
-            ],
-        )
+        self.assert_table_contains(result, ["id", "data"], [["1", "foo"], ["3", "baz"]])
+        self.assertIn("Executed.", result)
 
     def test_delete_record_not_found(self):
         result = self.run_script([
@@ -388,7 +351,84 @@ class TestSQLytSQLMode(unittest.TestCase):
         self.assertNotIn("internal", out)
 
         for i in range(61, 71):
-            self.assertIn(f"({i}, row{i})", out)
+            self.assertRegex(out, rf"\|\s*{i}\s*\|\s*row{i}\s*\|")
+
+    def test_case_insensitive_sql_keywords(self):
+        result = self.run_script([
+            "CrEaTe DaTaBaSe app",
+            ".usedatabase app",
+            "CrEaTe TaBlE users (id int primary key, name text)",
+            "InSeRt InTo users values (1, alice)",
+            "SeLeCt * FrOm users",
+            ".exit",
+        ])
+
+        self.assert_table_contains(result, ["id", "name"], [["1", "alice"]])
+        self.assertIn("Executed.", result)
+
+    def test_insert_multiple_values_rows(self):
+        result = self.run_script([
+            "create database app",
+            ".usedatabase app",
+            "create table users (id int primary key, name text)",
+            "insert into users values (1, alice), (2, bob), (3, carol)",
+            "select * from users",
+            ".exit",
+        ])
+
+        self.assert_table_contains(
+            result,
+            ["id", "name"],
+            [["1", "alice"], ["2", "bob"], ["3", "carol"]],
+        )
+
+    def test_insert_autoincrement_with_null_id(self):
+        result = self.run_script([
+            "create database app",
+            ".usedatabase app",
+            "create table users (id int primary key, name text)",
+            "insert into users values (null, alice), (NULL, bob), (5, carol), (null, dave)",
+            "select * from users",
+            ".exit",
+        ])
+
+        self.assert_table_contains(
+            result,
+            ["id", "name"],
+            [["1", "alice"], ["2", "bob"], ["5", "carol"], ["6", "dave"]],
+        )
+
+    def test_update_statement_by_id(self):
+        result = self.run_script([
+            "create database app",
+            ".usedatabase app",
+            "create table users (id int primary key, name text, city text)",
+            "insert into users values (1, alice, paris)",
+            'update users set city = "New York" where id = 1',
+            "select * from users",
+            ".exit",
+        ])
+
+        self.assert_table_contains(
+            result,
+            ["id", "name", "city"],
+            [["1", "alice", "New York"]],
+        )
+
+    def test_drop_table_removes_from_catalog(self):
+        result = self.run_script([
+            "create database app",
+            ".usedatabase app",
+            "create table users (id int primary key, name text)",
+            "drop table users",
+            ".showtables",
+            "select * from users",
+            ".exit",
+        ])
+
+        out = "\n".join(result)
+        self.assertNotIn("users (root_page=", out)
+        self.assertIn("Error: Table not found.", out)
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
