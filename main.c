@@ -1700,8 +1700,9 @@ static bool consume_keyword_ci(const char** p, const char* keyword) {
   if (strncasecmp(s, keyword, klen) != 0) {
     return false;
   }
-  if (s[klen] != '\0' && s[klen] != ' ' && s[klen] != '\t' && s[klen] != '\n' &&
-      s[klen] != '\r') {
+  if ((s[klen] >= 'a' && s[klen] <= 'z') ||
+      (s[klen] >= 'A' && s[klen] <= 'Z') ||
+      (s[klen] >= '0' && s[klen] <= '9') || s[klen] == '_') {
     return false;
   }
   *p = s + klen;
@@ -2050,6 +2051,21 @@ static uint32_t find_table_max_key(Table* table, bool* has_rows) {
 
   free(cursor);
   return max_key;
+}
+
+static bool table_has_key(Table* table, uint32_t key) {
+  Cursor* cursor = table_find(table, key);
+  void* node = get_page(table->pager, cursor->page_num);
+  uint32_t num_cells = *leaf_node_num_cells(node);
+  bool found = false;
+
+  if (cursor->cell_num < num_cells) {
+    uint32_t key_at_index = *tbl_leaf_key(table, node, cursor->cell_num);
+    found = (key_at_index == key);
+  }
+
+  free(cursor);
+  return found;
 }
 
 uint32_t allocate_next_root_page(Pager* pager) {
@@ -2527,6 +2543,7 @@ SqlExecuteResult execute_insert(Table* db, const SqlStatement* stmt) {
   Table user_table;
   bool has_rows;
   uint32_t max_key;
+  uint32_t planned_keys[MAX_INSERT_ROWS];
   char row_values[MAX_SCHEMA_COLUMNS][256];
   uint8_t row_buf[LEAF_NODE_SPACE_FOR_CELLS];
 
@@ -2544,6 +2561,7 @@ SqlExecuteResult execute_insert(Table* db, const SqlStatement* stmt) {
 
   max_key = find_table_max_key(&user_table, &has_rows);
 
+  /* Validate all rows and key conflicts first to keep statement behavior atomic. */
   for (uint32_t row = 0; row < stmt->row_count; row++) {
     uint32_t key;
     if (stmt->row_value_count[row] != schema.column_count) {
@@ -2568,6 +2586,40 @@ SqlExecuteResult execute_insert(Table* db, const SqlStatement* stmt) {
     if (!parse_u32_tokens_for_insert_values(row_values, &schema, key)) {
       return SQL_EXEC_INSERT_VALIDATION_FAILED;
     }
+    if (!pack_insert_row_values(row_values, &schema, &user_table.row_layout,
+                                row_buf)) {
+      return SQL_EXEC_ROW_PACK_FAILED;
+    }
+
+    planned_keys[row] = key;
+    for (uint32_t j = 0; j < row; j++) {
+      if (planned_keys[j] == key) {
+        return SQL_EXEC_DUPLICATE_KEY;
+      }
+    }
+    if (table_has_key(&user_table, key)) {
+      return SQL_EXEC_DUPLICATE_KEY;
+    }
+  }
+
+  max_key = find_table_max_key(&user_table, &has_rows);
+  for (uint32_t row = 0; row < stmt->row_count; row++) {
+    uint32_t key;
+
+    memcpy(row_values, stmt->values[row], sizeof(row_values));
+    if (stmt->row_auto_id[row]) {
+      key = has_rows ? max_key + 1 : 1;
+      snprintf(row_values[0], sizeof(row_values[0]), "%u", key);
+      max_key = key;
+      has_rows = true;
+    } else {
+      key = stmt->row_ids[row];
+      if (!has_rows || key > max_key) {
+        max_key = key;
+        has_rows = true;
+      }
+    }
+
     if (!pack_insert_row_values(row_values, &schema, &user_table.row_layout,
                                 row_buf)) {
       return SQL_EXEC_ROW_PACK_FAILED;
@@ -2747,6 +2799,8 @@ SqlExecuteResult execute_update(Table* db, const SqlStatement* stmt) {
   if (schema.column_type[target_col] == COLUMN_TYPE_INT) {
     uint32_t v;
     if (!parse_u32(stmt->update_value, &v)) {
+      printf("Type error: expected int for column %s.\n",
+             schema.column_names[target_col]);
       free(cursor);
       return SQL_EXEC_INSERT_VALIDATION_FAILED;
     }
@@ -2962,6 +3016,7 @@ MetaCommandResult do_meta_command(Session* session, InputBuffer* input_buffer) {
 int main(int argc, char* argv[]) {
   Session session;
   InputBuffer* input_buffer;
+  SqlStatement* stmt;
   const char* root_path;
 
   memset(&session, 0, sizeof(session));
@@ -2975,6 +3030,12 @@ int main(int argc, char* argv[]) {
   }
 
   input_buffer = new_input_buffer();
+  stmt = calloc(1, sizeof(SqlStatement));
+  if (stmt == NULL) {
+    printf("Unable to allocate statement buffer.\n");
+    close_input_buffer(input_buffer);
+    exit(EXIT_FAILURE);
+  }
   while (true) {
     print_prompt();
     read_input(input_buffer);
@@ -2982,6 +3043,7 @@ int main(int argc, char* argv[]) {
     if (input_buffer->buffer[0] == '.') {
       MetaCommandResult meta = do_meta_command(&session, input_buffer);
       if (meta == META_COMMAND_EXIT) {
+        free(stmt);
         close_input_buffer(input_buffer);
         if (session.database != NULL) {
           db_close(session.database);
@@ -2994,18 +3056,18 @@ int main(int argc, char* argv[]) {
       continue;
     }
 
-    SqlStatement stmt;
-    if (!parse_sql_statement(input_buffer->buffer, &stmt)) {
+    memset(stmt, 0, sizeof(*stmt));
+    if (!parse_sql_statement(input_buffer->buffer, stmt)) {
       printf("Syntax error. Could not parse SQL statement.\n");
       continue;
     }
 
-    if (stmt.type != SQL_STMT_CREATE_DATABASE &&
+    if (stmt->type != SQL_STMT_CREATE_DATABASE &&
         (!session.has_active_database || session.database == NULL)) {
       printf("No active database. Use .usedatabase <name>.\n");
       continue;
     }
 
-    execute_sql(&session, &stmt);
+    execute_sql(&session, stmt);
   }
 }

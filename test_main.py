@@ -382,6 +382,22 @@ class TestSQLytSQLMode(unittest.TestCase):
             [["1", "alice"], ["2", "bob"], ["3", "carol"]],
         )
 
+    def test_insert_values_without_space_before_tuple(self):
+        result = self.run_script([
+            "create database app",
+            ".usedatabase app",
+            "create table users (id int primary key, name text)",
+            "insert into users values(1, alice), (2, bob)",
+            "select * from users",
+            ".exit",
+        ])
+
+        self.assert_table_contains(
+            result,
+            ["id", "name"],
+            [["1", "alice"], ["2", "bob"]],
+        )
+
     def test_insert_autoincrement_with_null_id(self):
         result = self.run_script([
             "create database app",
@@ -397,6 +413,20 @@ class TestSQLytSQLMode(unittest.TestCase):
             ["id", "name"],
             [["1", "alice"], ["2", "bob"], ["5", "carol"], ["6", "dave"]],
         )
+
+    def test_multirow_insert_is_atomic_on_duplicate(self):
+        result = self.run_script([
+            "create database app",
+            ".usedatabase app",
+            "create table users (id int primary key, name text)",
+            "insert into users values (1, alice), (1, bob)",
+            "select * from users",
+            ".exit",
+        ])
+
+        out = "\n".join(result)
+        self.assertIn("Error: Duplicate key.", out)
+        self.assertIn("(0 rows)", out)
 
     def test_update_statement_by_id(self):
         result = self.run_script([
