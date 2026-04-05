@@ -360,5 +360,35 @@ class TestSQLytSQLMode(unittest.TestCase):
         self.assertIn("Tree:", out)
         # self.assertIn("internal", out)
 
+    def test_delete_underflow_rebalances_and_merges_leaves(self):
+        table = "items"
+        commands = [
+            "create database app",
+            ".usedatabase app",
+            f"create table {table} (id int primary key, name text)",
+        ]
+
+        for i in range(1, 71):
+            commands.append(f"insert into {table} values ({i}, row{i})")
+
+        for i in range(1, 61):
+            commands.append(f"delete from {table} where id = {i}")
+
+        commands.extend([
+            f".btree {table}",
+            f"select * from {table}",
+            ".exit",
+        ])
+
+        result = self.run_script(commands)
+        out = "\n".join(result)
+
+        self.assertIn("Tree:", out)
+        self.assertIn("- leaf (size 10)", out)
+        self.assertNotIn("internal", out)
+
+        for i in range(61, 71):
+            self.assertIn(f"({i}, row{i})", out)
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
