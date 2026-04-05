@@ -109,6 +109,14 @@ const uint32_t PAGE_SIZE = 4096;
 
 #define INVALID_PAGE_NUM UINT32_MAX
 
+#include <pthread.h>
+#define WAL_CHECKPOINT_THRESHOLD 100
+
+typedef struct {
+  uint32_t page_num;
+  uint32_t is_commit;
+} WalFrameHeader;
+
 typedef struct {
   int file_descriptor;
   uint32_t file_length;
@@ -116,6 +124,12 @@ typedef struct {
   uint32_t master_root_page;
   uint32_t next_root_page;
   void* pages[TABLE_MAX_PAGES];
+  int wal_file_descriptor;
+  uint32_t page_to_wal_frame[TABLE_MAX_PAGES];
+  uint32_t wal_frame_count;
+  uint8_t page_dirty[TABLE_MAX_PAGES];
+  bool checkpoint_in_progress;
+  pthread_mutex_t wal_mutex;
 } Pager;
 
 typedef struct {
@@ -124,6 +138,14 @@ typedef struct {
   uint32_t master_root_page;
   uint32_t next_root_page;
 } DbFileHeader;
+
+void mark_page_dirty(Pager* pager, uint32_t page_num) {
+  if (page_num < TABLE_MAX_PAGES) {
+    pager->page_dirty[page_num] = 1;
+  }
+}
+
+void pager_commit_transaction_sync(Pager* pager);
 
 struct Table {
   Pager* pager;
@@ -345,7 +367,16 @@ void* get_page(Pager* pager, uint32_t page_num) {
       num_pages += 1;
     }
 
-    if (page_num <= num_pages) {
+    if (pager->page_to_wal_frame[page_num] > 0) {
+      uint32_t frame_index = pager->page_to_wal_frame[page_num] - 1;
+      off_t offset = frame_index * (sizeof(WalFrameHeader) + PAGE_SIZE) + sizeof(WalFrameHeader);
+      lseek(pager->wal_file_descriptor, offset, SEEK_SET);
+      ssize_t bytes_read = read(pager->wal_file_descriptor, page, PAGE_SIZE);
+      if (bytes_read == -1) {
+        printf("Error reading WAL file\n");
+        exit(EXIT_FAILURE);
+      }
+    } else if (page_num <= num_pages) {
       lseek(pager->file_descriptor, page_num * PAGE_SIZE, SEEK_SET);
       ssize_t bytes_read = read(pager->file_descriptor, page, PAGE_SIZE);
       if (bytes_read == -1) {
@@ -611,21 +642,71 @@ Pager* pager_open(const char* filename) {
     exit(EXIT_FAILURE);
   }
 
+  char wal_filename[512];
+  snprintf(wal_filename, sizeof(wal_filename), "%s-wal", filename);
+  int wal_fd = open(wal_filename, O_RDWR | O_CREAT, S_IWUSR | S_IRUSR);
+  if (wal_fd == -1) {
+    printf("Unable to open WAL file\n");
+    exit(EXIT_FAILURE);
+  }
+
   off_t file_length = lseek(fd, 0, SEEK_END);
 
   Pager* pager = malloc(sizeof(Pager));
   pager->file_descriptor = fd;
+  pager->wal_file_descriptor = wal_fd;
   pager->file_length = file_length;
   pager->num_pages = (file_length / PAGE_SIZE);
-
-  if (file_length % PAGE_SIZE != 0) {
-    printf("Db file is not a whole number of pages. Corrupt file.\n");
-    exit(EXIT_FAILURE);
+  pager->wal_frame_count = 0;
+  pager->checkpoint_in_progress = false;
+  pthread_mutex_init(&pager->wal_mutex, NULL);
+  
+  if (file_length > 0 && file_length % PAGE_SIZE != 0) {
+    if (file_length == sizeof(DbFileHeader)) {
+      file_length = PAGE_SIZE;
+      ftruncate(fd, PAGE_SIZE);
+      pager->file_length = file_length;
+      pager->num_pages = 1;
+    } else {
+      printf("Db file is not a whole number of pages. Corrupt file.\n");
+      exit(EXIT_FAILURE);
+    }
   }
 
   for (uint32_t i = 0; i < TABLE_MAX_PAGES; i++) {
     pager->pages[i] = NULL;
+    pager->page_to_wal_frame[i] = 0;
+    pager->page_dirty[i] = 0;
   }
+
+  off_t wal_length = lseek(wal_fd, 0, SEEK_END);
+  uint32_t frame_size = sizeof(WalFrameHeader) + PAGE_SIZE;
+  uint32_t complete_frames = wal_length / frame_size;
+  
+  lseek(wal_fd, 0, SEEK_SET);
+  uint32_t last_commit_frame = 0;
+  for (uint32_t i = 0; i < complete_frames; i++) {
+    WalFrameHeader header;
+    read(wal_fd, &header, sizeof(WalFrameHeader));
+    pager->page_to_wal_frame[header.page_num] = i + 1;
+    lseek(wal_fd, PAGE_SIZE, SEEK_CUR); // Skip page data
+    if (header.is_commit) {
+      last_commit_frame = i + 1;
+    }
+  }
+  
+  if (complete_frames > last_commit_frame) {
+    ftruncate(wal_fd, last_commit_frame * frame_size);
+    for (uint32_t i = 0; i < TABLE_MAX_PAGES; i++) pager->page_to_wal_frame[i] = 0;
+    lseek(wal_fd, 0, SEEK_SET);
+    for (uint32_t i = 0; i < last_commit_frame; i++) {
+      WalFrameHeader header;
+      read(wal_fd, &header, sizeof(WalFrameHeader));
+      pager->page_to_wal_frame[header.page_num] = i + 1;
+      lseek(wal_fd, PAGE_SIZE, SEEK_CUR);
+    }
+  }
+  pager->wal_frame_count = last_commit_frame;
 
   return pager;
 }
@@ -672,19 +753,7 @@ uint32_t recover_next_root_page_from_master(Pager* pager, uint32_t master_root_p
   return max_root + 1;
 }
 
-void persist_header_now(Pager* pager, DbFileHeader* header) {
-  off_t offset = lseek(pager->file_descriptor, 0, SEEK_SET);
-  if (offset == -1) {
-    printf("Error seeking db header: %d\n", errno);
-    exit(EXIT_FAILURE);
-  }
-
-  ssize_t written = write(pager->file_descriptor, header, sizeof(DbFileHeader));
-  if (written != (ssize_t)sizeof(DbFileHeader)) {
-    printf("Error writing db header: %d\n", errno);
-    exit(EXIT_FAILURE);
-  }
-}
+// persist_header_now is removed because it circumvented WAL.
 
 Table* db_open(const char* filename) {
   Pager* pager = pager_open(filename);
@@ -706,7 +775,9 @@ Table* db_open(const char* filename) {
     void* root_node = get_page(pager, header->master_root_page);
     initialize_leaf_node(root_node);
     set_node_root(root_node, true);
-    persist_header_now(pager, header);
+    mark_page_dirty(pager, 0);
+    mark_page_dirty(pager, header->master_root_page);
+    pager_commit_transaction_sync(pager);
   } else {
     if (!header_is_valid(header)) {
       uint32_t repaired_master_root = DB_HEADER_MASTER_ROOT_PAGE;
@@ -726,7 +797,8 @@ Table* db_open(const char* filename) {
       header->version = DB_FORMAT_VERSION;
       header->master_root_page = repaired_master_root;
       header->next_root_page = repaired_next_root;
-      persist_header_now(pager, header);
+      mark_page_dirty(pager, 0);
+      pager_commit_transaction_sync(pager);
 
       printf("Recovered database header metadata.\n");
     }
@@ -769,25 +841,94 @@ void close_input_buffer(InputBuffer* input_buffer) {
   free(input_buffer);
 }
 
-void pager_flush(Pager* pager, uint32_t page_num) {
+void pager_flush(Pager* pager, uint32_t page_num, uint32_t is_commit) {
+  pthread_mutex_lock(&pager->wal_mutex);
   if (pager->pages[page_num] == NULL) {
     printf("Tried to flush null page\n");
     exit(EXIT_FAILURE);
   }
 
-  off_t offset = lseek(pager->file_descriptor, page_num * PAGE_SIZE, SEEK_SET);
+  uint32_t frame_index = pager->wal_frame_count;
+  off_t offset = frame_index * (sizeof(WalFrameHeader) + PAGE_SIZE);
+  lseek(pager->wal_file_descriptor, offset, SEEK_SET);
 
-  if (offset == -1) {
-    printf("Error seeking: %d\n", errno);
-    exit(EXIT_FAILURE);
+  WalFrameHeader header;
+  header.page_num = page_num;
+  header.is_commit = is_commit;
+  
+  if (write(pager->wal_file_descriptor, &header, sizeof(WalFrameHeader)) != sizeof(WalFrameHeader)) {
+      printf("Error writing WAL header: %d\n", errno);
+      exit(EXIT_FAILURE);
+  }
+  if (write(pager->wal_file_descriptor, pager->pages[page_num], PAGE_SIZE) != PAGE_SIZE) {
+      printf("Error writing WAL page: %d\n", errno);
+      exit(EXIT_FAILURE);
   }
 
-  ssize_t bytes_written =
-      write(pager->file_descriptor, pager->pages[page_num], PAGE_SIZE);
+  pager->page_to_wal_frame[page_num] = frame_index + 1;
+  pager->wal_frame_count += 1;
+  pthread_mutex_unlock(&pager->wal_mutex);
+}
 
-  if (bytes_written == -1) {
-    printf("Error writing: %d\n", errno);
-    exit(EXIT_FAILURE);
+void* background_checkpoint_task(void* arg) {
+  Pager* pager = (Pager*)arg;
+  pthread_mutex_lock(&pager->wal_mutex);
+  
+  for (uint32_t i = 0; i < TABLE_MAX_PAGES; i++) {
+    if (pager->page_to_wal_frame[i] > 0) {
+      uint32_t frame_index = pager->page_to_wal_frame[i] - 1;
+      off_t wal_offset = frame_index * (sizeof(WalFrameHeader) + PAGE_SIZE) + sizeof(WalFrameHeader);
+      
+      void* page = malloc(PAGE_SIZE);
+      lseek(pager->wal_file_descriptor, wal_offset, SEEK_SET);
+      read(pager->wal_file_descriptor, page, PAGE_SIZE);
+      
+      lseek(pager->file_descriptor, i * PAGE_SIZE, SEEK_SET);
+      write(pager->file_descriptor, page, PAGE_SIZE);
+      free(page);
+    }
+  }
+  
+  ftruncate(pager->wal_file_descriptor, 0);
+  pager->wal_frame_count = 0;
+  for (uint32_t i = 0; i < TABLE_MAX_PAGES; i++) {
+    pager->page_to_wal_frame[i] = 0;
+  }
+  
+  pager->checkpoint_in_progress = false;
+  pthread_mutex_unlock(&pager->wal_mutex);
+  return NULL;
+}
+
+void pager_checkpoint(Pager* pager) {
+  background_checkpoint_task(pager);
+}
+
+void pager_commit_transaction_sync(Pager* pager) {
+  uint32_t dirty_count = 0;
+  uint32_t last_dirty_page = 0;
+  
+  for (uint32_t i = 0; i < TABLE_MAX_PAGES; i++) {
+    if (pager->page_dirty[i]) {
+      dirty_count++;
+      last_dirty_page = i;
+    }
+  }
+  
+  if (dirty_count == 0) return;
+
+  for (uint32_t i = 0; i < TABLE_MAX_PAGES; i++) {
+    if (pager->page_dirty[i]) {
+      pager_flush(pager, i, (i == last_dirty_page) ? 1 : 0);
+      pager->page_dirty[i] = 0;
+    }
+  }
+
+  if (pager->wal_frame_count >= WAL_CHECKPOINT_THRESHOLD && !pager->checkpoint_in_progress) {
+    pager->checkpoint_in_progress = true;
+    pthread_t checkpoint_thread;
+    pthread_create(&checkpoint_thread, NULL, background_checkpoint_task, pager);
+    pthread_detach(checkpoint_thread);
   }
 }
 
@@ -798,12 +939,16 @@ void db_close(Table* table) {
     if (pager->pages[i] == NULL) {
       continue;
     }
-    pager_flush(pager, i);
+    // Flush to WAL
+    pager_flush(pager, i, 1);
     free(pager->pages[i]);
     pager->pages[i] = NULL;
   }
 
+  pager_checkpoint(pager); // Sync WAL to DB before exiting
+
   int result = close(pager->file_descriptor);
+  close(pager->wal_file_descriptor);
   if (result == -1) {
     printf("Error closing db file.\n");
     exit(EXIT_FAILURE);
@@ -823,7 +968,10 @@ void db_close(Table* table) {
 Until we start recycling free pages, new pages will always
 go onto the end of the database file
 */
-uint32_t get_unused_page_num(Pager* pager) { return pager->num_pages; }
+uint32_t get_unused_page_num(Pager* pager) {
+  mark_page_dirty(pager, pager->num_pages);
+  return pager->num_pages;
+}
 
 void create_new_root(Table* table, uint32_t right_child_page_num) {
   /*
@@ -875,6 +1023,7 @@ void internal_node_split_and_insert(Table* table, uint32_t parent_page_num,
 
 void internal_node_insert(Table* table, uint32_t parent_page_num,
                           uint32_t child_page_num) {
+  mark_page_dirty(table->pager, parent_page_num);
   /*
   Add a new child/key pair to parent that corresponds to child
   */
@@ -934,6 +1083,7 @@ void update_internal_node_key(void* node, uint32_t old_key, uint32_t new_key) {
 
 void internal_node_split_and_insert(Table* table, uint32_t parent_page_num,
                           uint32_t child_page_num) {
+  mark_page_dirty(table->pager, parent_page_num);
   uint32_t old_page_num = parent_page_num;
   void* old_node = get_page(table->pager,parent_page_num);
   uint32_t old_max = get_node_max_key(table, old_node);
@@ -1028,6 +1178,7 @@ void internal_node_split_and_insert(Table* table, uint32_t parent_page_num,
 
 void leaf_node_split_and_insert(Cursor* cursor, uint32_t key,
                                 const void* value) {
+  mark_page_dirty(cursor->table->pager, cursor->page_num);
   Table* t = cursor->table;
   uint32_t max_c = t->max_cells;
   uint32_t right_split = (max_c + 1) / 2;
@@ -1081,6 +1232,7 @@ void leaf_node_split_and_insert(Cursor* cursor, uint32_t key,
 }
 
 void leaf_node_insert(Cursor* cursor, uint32_t key, const void* value) {
+  mark_page_dirty(cursor->table->pager, cursor->page_num);
   Table* t = cursor->table;
   void* node = get_page(t->pager, cursor->page_num);
 
@@ -1858,6 +2010,12 @@ static void print_sql_execute_result(SqlExecuteResult r) {
 void execute_sql(Session* session, const SqlStatement* stmt) {
   SqlExecuteResult r = execute_statement(session, stmt);
   print_sql_execute_result(r);
+  
+  if (r == SQL_EXEC_OK && (stmt->type == SQL_STMT_INSERT || stmt->type == SQL_STMT_CREATE_TABLE || stmt->type == SQL_STMT_CREATE_DATABASE)) {
+    if (session->database && session->database->pager) {
+      pager_commit_transaction_sync(session->database->pager);
+    }
+  }
 }
 
 MetaCommandResult do_meta_command(Session* session, InputBuffer* input_buffer) {
