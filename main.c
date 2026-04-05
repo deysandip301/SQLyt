@@ -351,8 +351,8 @@ static inline uint32_t* leaf_key_sized(void* node, uint32_t cell_num,
 }
 
 void* get_page(Pager* pager, uint32_t page_num) {
-  if (page_num > TABLE_MAX_PAGES) {
-    printf("Tried to fetch page number out of bounds. %d > %d\n", page_num,
+  if (page_num >= TABLE_MAX_PAGES) {
+    printf("Tried to fetch page number out of bounds. %d >= %d\n", page_num,
            TABLE_MAX_PAGES);
     exit(EXIT_FAILURE);
   }
@@ -367,21 +367,34 @@ void* get_page(Pager* pager, uint32_t page_num) {
       num_pages += 1;
     }
 
+    // Hold wal_mutex while checking the WAL mapping and reading from WAL to
+    // prevent a concurrent checkpoint from truncating the WAL mid-read.
+    pthread_mutex_lock(&pager->wal_mutex);
     if (pager->page_to_wal_frame[page_num] > 0) {
       uint32_t frame_index = pager->page_to_wal_frame[page_num] - 1;
       off_t offset = frame_index * (sizeof(WalFrameHeader) + PAGE_SIZE) + sizeof(WalFrameHeader);
       lseek(pager->wal_file_descriptor, offset, SEEK_SET);
       ssize_t bytes_read = read(pager->wal_file_descriptor, page, PAGE_SIZE);
+      pthread_mutex_unlock(&pager->wal_mutex);
       if (bytes_read == -1) {
         printf("Error reading WAL file\n");
+        free(page);
         exit(EXIT_FAILURE);
       }
-    } else if (page_num <= num_pages) {
-      lseek(pager->file_descriptor, page_num * PAGE_SIZE, SEEK_SET);
-      ssize_t bytes_read = read(pager->file_descriptor, page, PAGE_SIZE);
-      if (bytes_read == -1) {
-        printf("Error reading file: %d\n", errno);
-        exit(EXIT_FAILURE);
+    } else {
+      pthread_mutex_unlock(&pager->wal_mutex);
+      if (page_num < num_pages) {
+        lseek(pager->file_descriptor, page_num * PAGE_SIZE, SEEK_SET);
+        ssize_t bytes_read = read(pager->file_descriptor, page, PAGE_SIZE);
+        if (bytes_read == -1) {
+          printf("Error reading file: %d\n", errno);
+          free(page);
+          exit(EXIT_FAILURE);
+        } else if ((uint32_t)bytes_read < PAGE_SIZE) {
+          memset((char*)page + bytes_read, 0, PAGE_SIZE - (uint32_t)bytes_read);
+        }
+      } else {
+        memset(page, 0, PAGE_SIZE);
       }
     }
 
@@ -688,7 +701,9 @@ Pager* pager_open(const char* filename) {
   for (uint32_t i = 0; i < complete_frames; i++) {
     WalFrameHeader header;
     read(wal_fd, &header, sizeof(WalFrameHeader));
-    pager->page_to_wal_frame[header.page_num] = i + 1;
+    if (header.page_num < TABLE_MAX_PAGES) {
+      pager->page_to_wal_frame[header.page_num] = i + 1;
+    }
     lseek(wal_fd, PAGE_SIZE, SEEK_CUR); // Skip page data
     if (header.is_commit) {
       last_commit_frame = i + 1;
@@ -702,7 +717,9 @@ Pager* pager_open(const char* filename) {
     for (uint32_t i = 0; i < last_commit_frame; i++) {
       WalFrameHeader header;
       read(wal_fd, &header, sizeof(WalFrameHeader));
-      pager->page_to_wal_frame[header.page_num] = i + 1;
+      if (header.page_num < TABLE_MAX_PAGES) {
+        pager->page_to_wal_frame[header.page_num] = i + 1;
+      }
       lseek(wal_fd, PAGE_SIZE, SEEK_CUR);
     }
   }
@@ -872,31 +889,73 @@ void pager_flush(Pager* pager, uint32_t page_num, uint32_t is_commit) {
 
 void* background_checkpoint_task(void* arg) {
   Pager* pager = (Pager*)arg;
+  bool checkpoint_failed = false;
   pthread_mutex_lock(&pager->wal_mutex);
-  
+
   for (uint32_t i = 0; i < TABLE_MAX_PAGES; i++) {
     if (pager->page_to_wal_frame[i] > 0) {
       uint32_t frame_index = pager->page_to_wal_frame[i] - 1;
       off_t wal_offset = frame_index * (sizeof(WalFrameHeader) + PAGE_SIZE) + sizeof(WalFrameHeader);
-      
+
       void* page = malloc(PAGE_SIZE);
-      lseek(pager->wal_file_descriptor, wal_offset, SEEK_SET);
-      read(pager->wal_file_descriptor, page, PAGE_SIZE);
-      
-      lseek(pager->file_descriptor, i * PAGE_SIZE, SEEK_SET);
-      write(pager->file_descriptor, page, PAGE_SIZE);
+      if (page == NULL) {
+        printf("Error allocating checkpoint page buffer\n");
+        checkpoint_failed = true;
+        break;
+      }
+
+      if (lseek(pager->wal_file_descriptor, wal_offset, SEEK_SET) == (off_t)-1) {
+        printf("Error seeking WAL during checkpoint: %d\n", errno);
+        free(page);
+        checkpoint_failed = true;
+        break;
+      }
+
+      ssize_t bytes_read = read(pager->wal_file_descriptor, page, PAGE_SIZE);
+      if (bytes_read == -1 || (uint32_t)bytes_read != PAGE_SIZE) {
+        printf("Error reading WAL page during checkpoint: %d\n", errno);
+        free(page);
+        checkpoint_failed = true;
+        break;
+      }
+
+      if (lseek(pager->file_descriptor, i * PAGE_SIZE, SEEK_SET) == (off_t)-1) {
+        printf("Error seeking database file during checkpoint: %d\n", errno);
+        free(page);
+        checkpoint_failed = true;
+        break;
+      }
+
+      ssize_t bytes_written = write(pager->file_descriptor, page, PAGE_SIZE);
+      if (bytes_written == -1 || (uint32_t)bytes_written != PAGE_SIZE) {
+        printf("Error writing database page during checkpoint: %d\n", errno);
+        free(page);
+        checkpoint_failed = true;
+        break;
+      }
+
       free(page);
     }
   }
-  
-  ftruncate(pager->wal_file_descriptor, 0);
-  pager->wal_frame_count = 0;
-  for (uint32_t i = 0; i < TABLE_MAX_PAGES; i++) {
-    pager->page_to_wal_frame[i] = 0;
+
+  if (!checkpoint_failed) {
+    if (ftruncate(pager->wal_file_descriptor, 0) == -1) {
+      printf("Error truncating WAL after checkpoint: %d\n", errno);
+      checkpoint_failed = true;
+    } else {
+      pager->wal_frame_count = 0;
+      for (uint32_t i = 0; i < TABLE_MAX_PAGES; i++) {
+        pager->page_to_wal_frame[i] = 0;
+      }
+    }
   }
-  
+
   pager->checkpoint_in_progress = false;
   pthread_mutex_unlock(&pager->wal_mutex);
+
+  if (checkpoint_failed) {
+    exit(EXIT_FAILURE);
+  }
   return NULL;
 }
 
@@ -924,8 +983,15 @@ void pager_commit_transaction_sync(Pager* pager) {
     }
   }
 
-  if (pager->wal_frame_count >= WAL_CHECKPOINT_THRESHOLD && !pager->checkpoint_in_progress) {
+  pthread_mutex_lock(&pager->wal_mutex);
+  bool should_checkpoint = (pager->wal_frame_count >= WAL_CHECKPOINT_THRESHOLD &&
+                             !pager->checkpoint_in_progress);
+  if (should_checkpoint) {
     pager->checkpoint_in_progress = true;
+  }
+  pthread_mutex_unlock(&pager->wal_mutex);
+
+  if (should_checkpoint) {
     pthread_t checkpoint_thread;
     pthread_create(&checkpoint_thread, NULL, background_checkpoint_task, pager);
     pthread_detach(checkpoint_thread);
@@ -935,12 +1001,18 @@ void pager_commit_transaction_sync(Pager* pager) {
 void db_close(Table* table) {
   Pager* pager = table->pager;
 
+  // Mark all in-memory pages dirty so they are committed as a single WAL
+  // transaction (only the last frame has is_commit=1), preventing partial
+  // commit visibility on crash during close.
   for (uint32_t i = 0; i < pager->num_pages; i++) {
-    if (pager->pages[i] == NULL) {
-      continue;
+    if (pager->pages[i] != NULL) {
+      pager->page_dirty[i] = 1;
     }
-    // Flush to WAL
-    pager_flush(pager, i, 1);
+  }
+  pager_commit_transaction_sync(pager);
+
+  for (uint32_t i = 0; i < pager->num_pages; i++) {
+    if (pager->pages[i] == NULL) continue;
     free(pager->pages[i]);
     pager->pages[i] = NULL;
   }
@@ -1502,6 +1574,7 @@ uint32_t allocate_next_root_page(Pager* pager) {
 
   pager->next_root_page += 1;
   header->next_root_page = pager->next_root_page;
+  mark_page_dirty(pager, 0);
   return root_page;
 }
 
@@ -1509,6 +1582,7 @@ bool create_table_root(Table* db, uint32_t root_page) {
   void* root_node = get_page(db->pager, root_page);
   initialize_leaf_node(root_node);
   set_node_root(root_node, true);
+  mark_page_dirty(db->pager, root_page);
   return true;
 }
 

@@ -304,7 +304,6 @@ class TestSQLytSQLMode(unittest.TestCase):
 
         result = self.run_script(commands)
         out = "\n".join(result)
-        print(out)
 
         self.assertIn("Tree:", out)
         # self.assertIn("internal", out)

@@ -3,7 +3,7 @@
 ## Build
 
 ```bash
-gcc -std=c11 main.c -o db
+gcc -std=c11 -pthread main.c -o db
 ```
 
 ## Run
