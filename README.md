@@ -97,6 +97,16 @@ insert into user values (1, 101, "Alice Doe", "alice@example.com", "New York")
 select * from user
 ```
 
+5. Delete a row
+
+```sql
+delete from user where id = 1
+```
+
+```sql
+select * from user
+```
+
 ## Quick Session Example
 
 ```text
@@ -108,6 +118,11 @@ insert into user values (1, 101, "Alice Doe", "alice@example.com")
 insert into user values (2, 102, "Bob", "bob@example.com")
 
 select * from user
+
+delete from user where id = 1
+
+select * from user
+
 .showtables
 .btree user
 .exit

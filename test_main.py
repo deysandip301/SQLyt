@@ -291,6 +291,58 @@ class TestSQLytSQLMode(unittest.TestCase):
             ],
         )
 
+    def test_delete_record(self):
+        result = self.run_script([
+            "create database app",
+            ".usedatabase app",
+            "create table items (id int primary key, data text)",
+            "insert into items values (1, foo)",
+            "insert into items values (2, bar)",
+            "insert into items values (3, baz)",
+            "delete from items where id = 2",
+            "select * from items",
+            ".exit",
+        ])
+
+        self.assertEqual(
+            result,
+            [
+                "db > Executed.",
+                "db > Using database app",
+                "db > Executed.",
+                "db > Executed.",
+                "db > Executed.",
+                "db > Executed.",
+                "db > Executed.",
+                "db > (1, foo)",
+                "(3, baz)",
+                "Executed.",
+                "db > ",
+            ],
+        )
+
+    def test_delete_record_not_found(self):
+        result = self.run_script([
+            "create database app",
+            ".usedatabase app",
+            "create table items (id int primary key, data text)",
+            "insert into items values (1, foo)",
+            "delete from items where id = 2",
+            ".exit",
+        ])
+
+        self.assertEqual(
+            result,
+            [
+                "db > Executed.",
+                "db > Using database app",
+                "db > Executed.",
+                "db > Executed.",
+                "db > Error: Record not found to delete.",
+                "db > ",
+            ],
+        )
+
     def test_btree_node_split_when(self):
         table = "bigtree"
         commands = [

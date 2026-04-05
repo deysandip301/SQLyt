@@ -66,7 +66,8 @@ typedef enum {
   SQL_STMT_CREATE_DATABASE,
   SQL_STMT_CREATE_TABLE,
   SQL_STMT_INSERT,
-  SQL_STMT_SELECT
+  SQL_STMT_SELECT,
+  SQL_STMT_DELETE
 } SqlStatementType;
 
 typedef struct Table Table;
@@ -95,6 +96,7 @@ typedef enum {
   SQL_EXEC_INSERT_VALIDATION_FAILED,
   SQL_EXEC_ROW_PACK_FAILED,
   SQL_EXEC_SELECT_LAYOUT_INVALID,
+  SQL_EXEC_DELETE_RECORD_NOT_FOUND,
 } SqlExecuteResult;
 
 typedef struct {
@@ -1305,6 +1307,22 @@ void leaf_node_split_and_insert(Cursor* cursor, uint32_t key,
   internal_node_insert(t, parent_page_num, new_page_num);
 }
 
+void leaf_node_delete(Cursor* cursor) {
+  uint32_t page_num = cursor->page_num;
+  void* node = get_page(cursor->table->pager, page_num);
+  uint32_t num_cells = *leaf_node_num_cells(node);
+
+  if (cursor->cell_num < num_cells - 1) {
+    void* dest = tbl_leaf_cell(cursor->table, node, cursor->cell_num);
+    void* src = tbl_leaf_cell(cursor->table, node, cursor->cell_num + 1);
+    size_t bytes_to_move = (num_cells - cursor->cell_num - 1) * cursor->table->cell_size;
+    memmove(dest, src, bytes_to_move);
+  }
+
+  *leaf_node_num_cells(node) -= 1;
+  mark_page_dirty(cursor->table->pager, page_num);
+}
+
 void leaf_node_insert(Cursor* cursor, uint32_t key, const void* value) {
   mark_page_dirty(cursor->table->pager, cursor->page_num);
   Table* t = cursor->table;
@@ -1806,6 +1824,42 @@ bool parse_select_from(char* line, SqlStatement* out) {
   return true;
 }
 
+bool parse_delete_from(char* line, SqlStatement* out) {
+  char copy[SQL_LINE_BUF];
+  char* tokens[16];
+  int count;
+
+  strncpy(copy, line, sizeof(copy) - 1);
+  copy[sizeof(copy) - 1] = '\0';
+  
+  for (int i = 0; copy[i] != '\0'; i++) {
+    if (copy[i] == '=') {
+      copy[i] = ' ';
+    }
+  }
+  
+  count = split_tokens_sql(copy, tokens, 16);
+
+  // e.g. "delete from user where id = 1" becomes tokens ["delete", "from", "user", "where", "id", "1"]
+  if (count != 6 || strcmp(tokens[0], "delete") != 0 || strcmp(tokens[1], "from") != 0 ||
+      strcmp(tokens[3], "where") != 0 || strcmp(tokens[4], "id") != 0) {
+    return false;
+  }
+  if (!is_valid_identifier(tokens[2], MAX_TABLE_NAME_LENGTH)) {
+    return false;
+  }
+
+  strncpy(out->table_name, tokens[2], sizeof(out->table_name) - 1);
+  out->table_name[sizeof(out->table_name) - 1] = '\0';
+  
+  if (!parse_u32(tokens[5], &out->id)) {
+    return false;
+  }
+
+  out->type = SQL_STMT_DELETE;
+  return true;
+}
+
 bool parse_sql_statement(char* line, SqlStatement* out) {
   if (strncmp(line, "create database", 15) == 0) {
     return parse_create_database(line, out);
@@ -1818,6 +1872,9 @@ bool parse_sql_statement(char* line, SqlStatement* out) {
   }
   if (strncmp(line, "select * from", 13) == 0) {
     return parse_select_from(line, out);
+  }
+  if (strncmp(line, "delete from", 11) == 0) {
+    return parse_delete_from(line, out);
   }
   return false;
 }
@@ -2017,6 +2074,36 @@ SqlExecuteResult execute_select(Table* db, const SqlStatement* stmt) {
   return SQL_EXEC_OK;
 }
 
+SqlExecuteResult execute_delete(Table* db, const SqlStatement* stmt) {
+  SqlSchema schema;
+  uint32_t root_page;
+  Table target;
+
+  if (!master_find_table(db, stmt->table_name, &schema, &root_page)) {
+    return SQL_EXEC_TABLE_NOT_FOUND;
+  }
+
+  if (!table_init_user(&target, db->pager, root_page, &schema)) {
+    return SQL_EXEC_SELECT_LAYOUT_INVALID;
+  }
+
+  Cursor* cursor = table_find(&target, stmt->id);
+  void* page = get_page(target.pager, cursor->page_num);
+  uint32_t num_cells = *leaf_node_num_cells(page);
+
+  if (cursor->cell_num < num_cells) {
+    uint32_t key_at_index = *tbl_leaf_key(&target, page, cursor->cell_num);
+    if (key_at_index == stmt->id) {
+       leaf_node_delete(cursor);
+       free(cursor);
+       return SQL_EXEC_OK;
+    }
+  }
+
+  free(cursor);
+  return SQL_EXEC_DELETE_RECORD_NOT_FOUND;
+}
+
 SqlExecuteResult execute_statement(Session* session, const SqlStatement* stmt) {
   Table* db = session->database;
 
@@ -2029,6 +2116,8 @@ SqlExecuteResult execute_statement(Session* session, const SqlStatement* stmt) {
       return execute_insert(db, stmt);
     case SQL_STMT_SELECT:
       return execute_select(db, stmt);
+    case SQL_STMT_DELETE:
+      return execute_delete(db, stmt);
   }
   return SQL_EXEC_OK;
 }
@@ -2074,6 +2163,9 @@ static void print_sql_execute_result(SqlExecuteResult r) {
       break;
     case SQL_EXEC_SELECT_LAYOUT_INVALID:
       printf("Error: Invalid table layout.\n");
+      break;
+    case SQL_EXEC_DELETE_RECORD_NOT_FOUND:
+      printf("Error: Record not found to delete.\n");
       break;
   }
 }
