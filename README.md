@@ -71,6 +71,7 @@ create database app
 2. Create a table
 - first column must be `id int` (optionally `primary key`)
 - remaining columns can be `int` or `text`
+- `text` values are capped at **64 characters**; longer strings will be rejected
 
 ```sql
 create table user (

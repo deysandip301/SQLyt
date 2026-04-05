@@ -413,6 +413,9 @@ void* get_page(Pager* pager, uint32_t page_num) {
 uint32_t get_node_max_key(Table* table, void* node) {
   if (get_node_type(node) == NODE_LEAF) {
     uint32_t n = *leaf_node_num_cells(node);
+    if (n == 0) {
+      return 0;
+    }
     return *tbl_leaf_key(table, node, n - 1);
   }
   void* right_child = get_page(table->pager, *internal_node_right_child(node));
@@ -2174,7 +2177,7 @@ void execute_sql(Session* session, const SqlStatement* stmt) {
   SqlExecuteResult r = execute_statement(session, stmt);
   print_sql_execute_result(r);
   
-  if (r == SQL_EXEC_OK && (stmt->type == SQL_STMT_INSERT || stmt->type == SQL_STMT_CREATE_TABLE || stmt->type == SQL_STMT_CREATE_DATABASE)) {
+  if (r == SQL_EXEC_OK && (stmt->type == SQL_STMT_INSERT || stmt->type == SQL_STMT_CREATE_TABLE || stmt->type == SQL_STMT_CREATE_DATABASE || stmt->type == SQL_STMT_DELETE)) {
     if (session->database && session->database->pager) {
       pager_commit_transaction_sync(session->database->pager);
     }

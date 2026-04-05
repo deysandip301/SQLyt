@@ -69,7 +69,7 @@ class TestSQLytSQLMode(unittest.TestCase):
             ],
         )
 
-    def test_fixed_varchar_enforced(self):
+    def test_max_text_length_enforced(self):
         result = self.run_script([
             "create database app",
             ".usedatabase app",
@@ -222,7 +222,7 @@ class TestSQLytSQLMode(unittest.TestCase):
             ],
         )
 
-    def test_supports_int_and_varchar_mixed_columns(self):
+    def test_supports_int_and_text_mixed_columns(self):
         result = self.run_script([
             "create database app",
             ".usedatabase app",
