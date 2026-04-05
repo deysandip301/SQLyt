@@ -6,6 +6,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <unistd.h>
 #include <sys/stat.h>
 #include <dirent.h>
@@ -47,6 +48,7 @@ typedef enum {
   (sizeof(uint32_t) + CATALOG_TABLE_NAME_SIZE + CATALOG_SCHEMA_STORAGE)
 #define SCHEMA_TEXT_MAX CATALOG_SCHEMA_STORAGE
 #define SQL_LINE_BUF 1024
+#define MAX_INSERT_ROWS 32
 
 typedef struct {
   uint32_t column_count;
@@ -67,7 +69,9 @@ typedef enum {
   SQL_STMT_CREATE_TABLE,
   SQL_STMT_INSERT,
   SQL_STMT_SELECT,
-  SQL_STMT_DELETE
+  SQL_STMT_DELETE,
+  SQL_STMT_UPDATE,
+  SQL_STMT_DROP_TABLE
 } SqlStatementType;
 
 typedef struct Table Table;
@@ -76,8 +80,13 @@ typedef struct {
   SqlStatementType type;
   char table_name[MAX_TABLE_NAME_LENGTH + 1];
   uint32_t id;
-  uint32_t value_count;
-  char values[MAX_SCHEMA_COLUMNS][256];
+  char update_column[MAX_COLUMN_NAME_LENGTH + 1];
+  char update_value[256];
+  uint32_t row_count;
+  uint32_t row_value_count[MAX_INSERT_ROWS];
+  uint32_t row_ids[MAX_INSERT_ROWS];
+  bool row_auto_id[MAX_INSERT_ROWS];
+  char values[MAX_INSERT_ROWS][MAX_SCHEMA_COLUMNS][256];
   SqlSchema schema;
 } SqlStatement;
 
@@ -97,6 +106,10 @@ typedef enum {
   SQL_EXEC_ROW_PACK_FAILED,
   SQL_EXEC_SELECT_LAYOUT_INVALID,
   SQL_EXEC_DELETE_RECORD_NOT_FOUND,
+  SQL_EXEC_UPDATE_COLUMN_NOT_FOUND,
+  SQL_EXEC_UPDATE_PK_NOT_ALLOWED,
+  SQL_EXEC_UPDATE_RECORD_NOT_FOUND,
+  SQL_EXEC_RESERVED_DROP_TABLE,
 } SqlExecuteResult;
 
 typedef struct {
@@ -1650,6 +1663,200 @@ bool parse_u32(const char* text, uint32_t* value) {
   return true;
 }
 
+static void skip_spaces(const char** p) {
+  while (**p == ' ' || **p == '\t' || **p == '\n' || **p == '\r') {
+    (*p)++;
+  }
+}
+
+static bool parse_identifier_token_ci(const char** p, char* out,
+                                      size_t out_size) {
+  size_t len = 0;
+  const char* s;
+  skip_spaces(p);
+  s = *p;
+  if (!((*s >= 'a' && *s <= 'z') || (*s >= 'A' && *s <= 'Z') || *s == '_')) {
+    return false;
+  }
+  while (((*s >= 'a' && *s <= 'z') || (*s >= 'A' && *s <= 'Z') ||
+          (*s >= '0' && *s <= '9') || *s == '_') &&
+         len + 1 < out_size) {
+    out[len++] = *s;
+    s++;
+  }
+  out[len] = '\0';
+  if (!is_valid_identifier(out, out_size - 1)) {
+    return false;
+  }
+  *p = s;
+  return true;
+}
+
+static bool consume_keyword_ci(const char** p, const char* keyword) {
+  size_t klen = strlen(keyword);
+  const char* s;
+  skip_spaces(p);
+  s = *p;
+  if (strncasecmp(s, keyword, klen) != 0) {
+    return false;
+  }
+  if ((s[klen] >= 'a' && s[klen] <= 'z') ||
+      (s[klen] >= 'A' && s[klen] <= 'Z') ||
+      (s[klen] >= '0' && s[klen] <= '9') || s[klen] == '_') {
+    return false;
+  }
+  *p = s + klen;
+  return true;
+}
+
+static bool parse_sql_value_token(const char** p, char* out, size_t out_size) {
+  size_t len = 0;
+  const char* s;
+  skip_spaces(p);
+  s = *p;
+  if (*s == '"') {
+    s++;
+    while (*s != '\0' && *s != '"') {
+      if (len + 1 >= out_size) {
+        return false;
+      }
+      out[len++] = *s;
+      s++;
+    }
+    if (*s != '"') {
+      return false;
+    }
+    s++;
+  } else {
+    while (*s != '\0' && *s != ',' && *s != ')' && *s != ';' && *s != ' ' &&
+           *s != '\t' && *s != '\n' && *s != '\r') {
+      if (len + 1 >= out_size) {
+        return false;
+      }
+      out[len++] = *s;
+      s++;
+    }
+  }
+  out[len] = '\0';
+  if (len == 0) {
+    return false;
+  }
+  *p = s;
+  return true;
+}
+
+static bool parse_insert_values_clause(const char* values_start,
+                                       SqlStatement* out) {
+  const char* p = values_start;
+  uint32_t row = 0;
+  skip_spaces(&p);
+  while (*p != '\0') {
+    uint32_t col = 0;
+    if (row >= MAX_INSERT_ROWS) {
+      return false;
+    }
+    if (*p != '(') {
+      return false;
+    }
+    p++;
+    skip_spaces(&p);
+    while (true) {
+      if (col >= MAX_SCHEMA_COLUMNS) {
+        return false;
+      }
+      if (!parse_sql_value_token(&p, out->values[row][col],
+                                 sizeof(out->values[row][col]))) {
+        return false;
+      }
+      col++;
+      skip_spaces(&p);
+      if (*p == ',') {
+        p++;
+        skip_spaces(&p);
+        continue;
+      }
+      if (*p == ')') {
+        p++;
+        break;
+      }
+      return false;
+    }
+
+    if (col == 0) {
+      return false;
+    }
+    out->row_value_count[row] = col;
+    if (strcasecmp(out->values[row][0], "null") == 0) {
+      out->row_auto_id[row] = true;
+      out->row_ids[row] = 0;
+    } else {
+      out->row_auto_id[row] = false;
+      if (!parse_u32(out->values[row][0], &out->row_ids[row])) {
+        return false;
+      }
+    }
+
+    row++;
+    skip_spaces(&p);
+    if (*p == ',') {
+      p++;
+      skip_spaces(&p);
+      continue;
+    }
+    break;
+  }
+
+  skip_spaces(&p);
+  if (*p == ';') {
+    p++;
+    skip_spaces(&p);
+  }
+  if (*p != '\0' || row == 0) {
+    return false;
+  }
+  out->row_count = row;
+  return true;
+}
+
+static size_t bounded_text_len(const char* text, size_t max_len) {
+  size_t n = 0;
+  while (n < max_len && text[n] != '\0') {
+    n++;
+  }
+  return n;
+}
+
+static void print_table_border(const size_t* widths, uint32_t count) {
+  printf("+");
+  for (uint32_t i = 0; i < count; i++) {
+    for (size_t j = 0; j < widths[i] + 2; j++) {
+      printf("-");
+    }
+    printf("+");
+  }
+  printf("\n");
+}
+
+static void print_table_cell_text(const char* text, size_t width,
+                                  bool right_align) {
+  size_t len = strlen(text);
+  size_t pad = (width > len) ? (width - len) : 0;
+
+  printf(" ");
+  if (right_align) {
+    for (size_t i = 0; i < pad; i++) {
+      printf(" ");
+    }
+    printf("%s", text);
+  } else {
+    printf("%s", text);
+    for (size_t i = 0; i < pad; i++) {
+      printf(" ");
+    }
+  }
+  printf(" ");
+}
+
 bool split_schema_payload(const char* payload, SqlSchema* schema) {
   char temp[SCHEMA_TEXT_MAX + 1];
   char* parts[1 + (MAX_SCHEMA_COLUMNS * 3)];
@@ -1727,21 +1934,22 @@ bool make_schema_payload(const SqlSchema* schema, char* out, size_t out_size) {
   return true;
 }
 
-bool pack_insert_row(const SqlStatement* stmt, const SqlSchema* schema,
-                     const RowLayout* L, uint8_t* out) {
+bool pack_insert_row_values(const char values[MAX_SCHEMA_COLUMNS][256],
+                            const SqlSchema* schema, const RowLayout* L,
+                            uint8_t* out) {
   memset(out, 0, L->value_size);
   for (uint32_t i = 0; i < schema->column_count; i++) {
     uint32_t off = L->col_offset[i];
     uint32_t sz = L->col_size[i];
     if (schema->column_type[i] == COLUMN_TYPE_INT) {
       uint32_t v;
-      if (!parse_u32(stmt->values[i], &v)) {
+      if (!parse_u32(values[i], &v)) {
         return false;
       }
 
       memcpy(out + off, &v, sizeof(uint32_t));
     } else {
-      const char* s = stmt->values[i];
+      const char* s = values[i];
       size_t len = strlen(s);
       if (len > sz) {
         return false;
@@ -1752,21 +1960,22 @@ bool pack_insert_row(const SqlStatement* stmt, const SqlSchema* schema,
   return true;
 }
 
-bool parse_u32_tokens_for_insert(const SqlStatement* stmt,
-                                 const SqlSchema* schema) {
+bool parse_u32_tokens_for_insert_values(
+    const char values[MAX_SCHEMA_COLUMNS][256], const SqlSchema* schema,
+    uint32_t key) {
   for (uint32_t i = 0; i < schema->column_count; i++) {
     if (schema->column_type[i] == COLUMN_TYPE_INT) {
       uint32_t v;
-      if (!parse_u32(stmt->values[i], &v)) {
+      if (!parse_u32(values[i], &v)) {
         printf("Type error: expected int for column %s.\n",
                schema->column_names[i]);
         return false;
       }
-      if (i == 0 && v != stmt->id) {
+      if (i == 0 && v != key) {
         return false;
       }
     } else if (schema->column_type[i] == COLUMN_TYPE_TEXT) {
-      if (strlen(stmt->values[i]) > schema->column_max[i]) {
+      if (strlen(values[i]) > schema->column_max[i]) {
         printf("String is too long.\n");
         return false;
       }
@@ -1813,7 +2022,7 @@ bool master_find_table(Table* db, const char* table_name, SqlSchema* schema,
     uint32_t dummy_root;
     catalog_read_value(tbl_leaf_value(&master_table, node, cursor->cell_num),
                        &dummy_root, name_buf, schema_buf, sizeof(schema_buf));
-    if (strcmp(name_buf, table_name) == 0) {
+    if (strcasecmp(name_buf, table_name) == 0) {
       bool ok = split_schema_payload(schema_buf, schema);
       if (ok && root_page != NULL) {
         *root_page = key;
@@ -1826,6 +2035,37 @@ bool master_find_table(Table* db, const char* table_name, SqlSchema* schema,
 
   free(cursor);
   return false;
+}
+
+static uint32_t find_table_max_key(Table* table, bool* has_rows) {
+  Cursor* cursor = table_start(table);
+  uint32_t max_key = 0;
+
+  *has_rows = false;
+  while (!cursor->end_of_table) {
+    void* node = get_page(table->pager, cursor->page_num);
+    max_key = *tbl_leaf_key(table, node, cursor->cell_num);
+    *has_rows = true;
+    cursor_advance(cursor);
+  }
+
+  free(cursor);
+  return max_key;
+}
+
+static bool table_has_key(Table* table, uint32_t key) {
+  Cursor* cursor = table_find(table, key);
+  void* node = get_page(table->pager, cursor->page_num);
+  uint32_t num_cells = *leaf_node_num_cells(node);
+  bool found = false;
+
+  if (cursor->cell_num < num_cells) {
+    uint32_t key_at_index = *tbl_leaf_key(table, node, cursor->cell_num);
+    found = (key_at_index == key);
+  }
+
+  free(cursor);
+  return found;
 }
 
 uint32_t allocate_next_root_page(Pager* pager) {
@@ -1905,20 +2145,22 @@ bool parse_create_table(char* line, SqlStatement* out) {
   copy[sizeof(copy) - 1] = '\0';
 
   count = split_tokens_sql(copy, tokens, 64);
-  if (count < 8 || strcmp(tokens[0], "create") != 0 || strcmp(tokens[1], "table") != 0) {
+  if (count < 8 || strcasecmp(tokens[0], "create") != 0 ||
+      strcasecmp(tokens[1], "table") != 0) {
     return false;
   }
   if (!is_valid_identifier(tokens[2], MAX_TABLE_NAME_LENGTH)) {
     return false;
   }
 
-  if (count < 8 || strcmp(tokens[3], "id") != 0 || strcmp(tokens[4], "int") != 0) {
+  if (count < 8 || strcasecmp(tokens[3], "id") != 0 ||
+      strcasecmp(tokens[4], "int") != 0) {
     return false;
   }
 
   index = 5;
-  if (index + 1 < count && strcmp(tokens[index], "primary") == 0 &&
-      strcmp(tokens[index + 1], "key") == 0) {
+  if (index + 1 < count && strcasecmp(tokens[index], "primary") == 0 &&
+      strcasecmp(tokens[index + 1], "key") == 0) {
     index += 2;
   }
 
@@ -1945,11 +2187,11 @@ bool parse_create_table(char* line, SqlStatement* out) {
     }
     col_name = tokens[index];
 
-    if (strcmp(tokens[index + 1], "int") == 0) {
+    if (strcasecmp(tokens[index + 1], "int") == 0) {
       max_len = 0;
       out->schema.column_type[out->schema.column_count] = COLUMN_TYPE_INT;
       advance = 2;
-    } else if (strcmp(tokens[index + 1], "text") == 0) {
+    } else if (strcasecmp(tokens[index + 1], "text") == 0) {
       max_len = MAX_CELL_TEXT;
       out->schema.column_type[out->schema.column_count] = COLUMN_TYPE_TEXT;
       advance = 2;
@@ -1977,50 +2219,33 @@ bool parse_create_table(char* line, SqlStatement* out) {
 }
 
 bool parse_insert_into(char* line, SqlStatement* out) {
-  char copy[SQL_LINE_BUF];
-  char* tokens[64];
-  int count;
-  int values_idx = -1;
+  const char* p = line;
+  const char* values_start;
 
-  strncpy(copy, line, sizeof(copy) - 1);
-  copy[sizeof(copy) - 1] = '\0';
-  count = split_tokens_sql(copy, tokens, 64);
+  memset(out->row_value_count, 0, sizeof(out->row_value_count));
+  memset(out->row_ids, 0, sizeof(out->row_ids));
+  memset(out->row_auto_id, 0, sizeof(out->row_auto_id));
+  out->row_count = 0;
 
-  if (count < 6 || strcmp(tokens[0], "insert") != 0 || strcmp(tokens[1], "into") != 0) {
+  if (!consume_keyword_ci(&p, "insert")) {
     return false;
   }
-  if (!is_valid_identifier(tokens[2], MAX_TABLE_NAME_LENGTH)) {
+  if (!consume_keyword_ci(&p, "into")) {
     return false;
   }
-  for (int i = 3; i < count; i++) {
-    if (strcmp(tokens[i], "values") == 0) {
-      values_idx = i;
-      break;
-    }
-  }
-  if (values_idx == -1 || values_idx + 1 >= count) {
+  if (!parse_identifier_token_ci(&p, out->table_name, sizeof(out->table_name))) {
     return false;
   }
+  if (!consume_keyword_ci(&p, "values")) {
+    return false;
+  }
+  values_start = p;
 
-  strncpy(out->table_name, tokens[2], sizeof(out->table_name) - 1);
-  out->table_name[sizeof(out->table_name) - 1] = '\0';
-
-  if (!parse_u32(tokens[values_idx + 1], &out->id)) {
+  if (!parse_insert_values_clause(values_start, out)) {
     return false;
   }
 
-  strncpy(out->values[0], tokens[values_idx + 1], 255);
-  out->values[0][255] = '\0';
-  out->value_count = 1;
-  for (int i = values_idx + 2; i < count; i++) {
-    if (out->value_count >= MAX_SCHEMA_COLUMNS) {
-      return false;
-    }
-    strncpy(out->values[out->value_count], tokens[i], 255);
-    out->values[out->value_count][255] = '\0';
-    out->value_count += 1;
-  }
-
+  out->id = out->row_count > 0 ? out->row_ids[0] : 0;
   out->type = SQL_STMT_INSERT;
   return true;
 }
@@ -2033,8 +2258,8 @@ bool parse_create_database(char* line, SqlStatement* out) {
   strncpy(copy, line, sizeof(copy) - 1);
   copy[sizeof(copy) - 1] = '\0';
   count = split_tokens_sql(copy, tokens, 4);
-  if (count != 3 || strcmp(tokens[0], "create") != 0 ||
-      strcmp(tokens[1], "database") != 0) {
+  if (count != 3 || strcasecmp(tokens[0], "create") != 0 ||
+      strcasecmp(tokens[1], "database") != 0) {
     return false;
   }
   if (!is_valid_identifier(tokens[2], MAX_TABLE_NAME_LENGTH)) {
@@ -2056,8 +2281,8 @@ bool parse_select_from(char* line, SqlStatement* out) {
   copy[sizeof(copy) - 1] = '\0';
   count = split_tokens_sql(copy, tokens, 16);
 
-  if (count != 4 || strcmp(tokens[0], "select") != 0 || strcmp(tokens[1], "*") != 0 ||
-      strcmp(tokens[2], "from") != 0) {
+  if (count != 4 || strcasecmp(tokens[0], "select") != 0 ||
+      strcmp(tokens[1], "*") != 0 || strcasecmp(tokens[2], "from") != 0) {
     return false;
   }
   if (!is_valid_identifier(tokens[3], MAX_TABLE_NAME_LENGTH)) {
@@ -2087,8 +2312,9 @@ bool parse_delete_from(char* line, SqlStatement* out) {
   count = split_tokens_sql(copy, tokens, 16);
 
   // e.g. "delete from user where id = 1" becomes tokens ["delete", "from", "user", "where", "id", "1"]
-  if (count != 6 || strcmp(tokens[0], "delete") != 0 || strcmp(tokens[1], "from") != 0 ||
-      strcmp(tokens[3], "where") != 0 || strcmp(tokens[4], "id") != 0) {
+  if (count != 6 || strcasecmp(tokens[0], "delete") != 0 ||
+      strcasecmp(tokens[1], "from") != 0 || strcasecmp(tokens[3], "where") != 0 ||
+      strcasecmp(tokens[4], "id") != 0) {
     return false;
   }
   if (!is_valid_identifier(tokens[2], MAX_TABLE_NAME_LENGTH)) {
@@ -2106,23 +2332,71 @@ bool parse_delete_from(char* line, SqlStatement* out) {
   return true;
 }
 
+bool parse_update_table(char* line, SqlStatement* out) {
+  char copy[SQL_LINE_BUF];
+  char* tokens[32];
+  int count;
+
+  strncpy(copy, line, sizeof(copy) - 1);
+  copy[sizeof(copy) - 1] = '\0';
+
+  for (int i = 0; copy[i] != '\0'; i++) {
+    if (copy[i] == '=') {
+      copy[i] = ' ';
+    }
+  }
+  count = split_tokens_sql(copy, tokens, 32);
+
+  if (count != 8 || strcasecmp(tokens[0], "update") != 0 ||
+      strcasecmp(tokens[2], "set") != 0 || strcasecmp(tokens[5], "where") != 0 ||
+      strcasecmp(tokens[6], "id") != 0) {
+    return false;
+  }
+  if (!is_valid_identifier(tokens[1], MAX_TABLE_NAME_LENGTH) ||
+      !is_valid_identifier(tokens[3], MAX_COLUMN_NAME_LENGTH)) {
+    return false;
+  }
+  if (!parse_u32(tokens[7], &out->id)) {
+    return false;
+  }
+
+  strncpy(out->table_name, tokens[1], sizeof(out->table_name) - 1);
+  out->table_name[sizeof(out->table_name) - 1] = '\0';
+  strncpy(out->update_column, tokens[3], sizeof(out->update_column) - 1);
+  out->update_column[sizeof(out->update_column) - 1] = '\0';
+  strncpy(out->update_value, tokens[4], sizeof(out->update_value) - 1);
+  out->update_value[sizeof(out->update_value) - 1] = '\0';
+  out->type = SQL_STMT_UPDATE;
+  return true;
+}
+
+bool parse_drop_table(char* line, SqlStatement* out) {
+  char copy[SQL_LINE_BUF];
+  char* tokens[8];
+  int count;
+
+  strncpy(copy, line, sizeof(copy) - 1);
+  copy[sizeof(copy) - 1] = '\0';
+  count = split_tokens_sql(copy, tokens, 8);
+  if (count != 3 || strcasecmp(tokens[0], "drop") != 0 ||
+      strcasecmp(tokens[1], "table") != 0) {
+    return false;
+  }
+  if (!is_valid_identifier(tokens[2], MAX_TABLE_NAME_LENGTH)) {
+    return false;
+  }
+
+  strncpy(out->table_name, tokens[2], sizeof(out->table_name) - 1);
+  out->table_name[sizeof(out->table_name) - 1] = '\0';
+  out->type = SQL_STMT_DROP_TABLE;
+  return true;
+}
+
 bool parse_sql_statement(char* line, SqlStatement* out) {
-  if (strncmp(line, "create database", 15) == 0) {
-    return parse_create_database(line, out);
-  }
-  if (strncmp(line, "create table", 12) == 0) {
-    return parse_create_table(line, out);
-  }
-  if (strncmp(line, "insert into", 11) == 0) {
-    return parse_insert_into(line, out);
-  }
-  if (strncmp(line, "select * from", 13) == 0) {
-    return parse_select_from(line, out);
-  }
-  if (strncmp(line, "delete from", 11) == 0) {
-    return parse_delete_from(line, out);
-  }
-  return false;
+  return parse_create_database(line, out) || parse_create_table(line, out) ||
+         parse_insert_into(line, out) || parse_select_from(line, out) ||
+         parse_delete_from(line, out) || parse_update_table(line, out) ||
+         parse_drop_table(line, out);
 }
 
 bool switch_database(Session* session, const char* db_name) {
@@ -2267,33 +2541,94 @@ SqlExecuteResult execute_insert(Table* db, const SqlStatement* stmt) {
   uint32_t root_page;
   ExecuteResult btree_result;
   Table user_table;
+  bool has_rows;
+  uint32_t max_key;
+  uint32_t planned_keys[MAX_INSERT_ROWS];
+  char row_values[MAX_SCHEMA_COLUMNS][256];
   uint8_t row_buf[LEAF_NODE_SPACE_FOR_CELLS];
 
   if (!master_find_table(db, stmt->table_name, &schema, &root_page)) {
     return SQL_EXEC_TABLE_NOT_FOUND;
   }
-  if (stmt->value_count != schema.column_count) {
-    printf("Error: Expected %u values.\n", schema.column_count);
-    return SQL_EXEC_WRONG_VALUE_COUNT;
-  }
 
   if (schema.column_count == 0 || schema.column_type[0] != COLUMN_TYPE_INT) {
     return SQL_EXEC_SCHEMA_INVALID_PK;
-  }
-  if (!parse_u32_tokens_for_insert(stmt, &schema)) {
-    return SQL_EXEC_INSERT_VALIDATION_FAILED;
   }
 
   if (!table_init_user(&user_table, db->pager, root_page, &schema)) {
     return SQL_EXEC_ROW_LAYOUT_TOO_LARGE;
   }
-  if (!pack_insert_row(stmt, &schema, &user_table.row_layout, row_buf)) {
-    return SQL_EXEC_ROW_PACK_FAILED;
+
+  max_key = find_table_max_key(&user_table, &has_rows);
+
+  /* Validate all rows and key conflicts first to keep statement behavior atomic. */
+  for (uint32_t row = 0; row < stmt->row_count; row++) {
+    uint32_t key;
+    if (stmt->row_value_count[row] != schema.column_count) {
+      printf("Error: Expected %u values.\n", schema.column_count);
+      return SQL_EXEC_WRONG_VALUE_COUNT;
+    }
+
+    memcpy(row_values, stmt->values[row], sizeof(row_values));
+    if (stmt->row_auto_id[row]) {
+      key = has_rows ? max_key + 1 : 1;
+      snprintf(row_values[0], sizeof(row_values[0]), "%u", key);
+      max_key = key;
+      has_rows = true;
+    } else {
+      key = stmt->row_ids[row];
+      if (!has_rows || key > max_key) {
+        max_key = key;
+        has_rows = true;
+      }
+    }
+
+    if (!parse_u32_tokens_for_insert_values(row_values, &schema, key)) {
+      return SQL_EXEC_INSERT_VALIDATION_FAILED;
+    }
+    if (!pack_insert_row_values(row_values, &schema, &user_table.row_layout,
+                                row_buf)) {
+      return SQL_EXEC_ROW_PACK_FAILED;
+    }
+
+    planned_keys[row] = key;
+    for (uint32_t j = 0; j < row; j++) {
+      if (planned_keys[j] == key) {
+        return SQL_EXEC_DUPLICATE_KEY;
+      }
+    }
+    if (table_has_key(&user_table, key)) {
+      return SQL_EXEC_DUPLICATE_KEY;
+    }
   }
 
-  btree_result = insert_row_into_table(&user_table, stmt->id, row_buf);
-  if (btree_result == EXECUTE_DUPLICATE_KEY) {
-    return SQL_EXEC_DUPLICATE_KEY;
+  max_key = find_table_max_key(&user_table, &has_rows);
+  for (uint32_t row = 0; row < stmt->row_count; row++) {
+    uint32_t key;
+
+    memcpy(row_values, stmt->values[row], sizeof(row_values));
+    if (stmt->row_auto_id[row]) {
+      key = has_rows ? max_key + 1 : 1;
+      snprintf(row_values[0], sizeof(row_values[0]), "%u", key);
+      max_key = key;
+      has_rows = true;
+    } else {
+      key = stmt->row_ids[row];
+      if (!has_rows || key > max_key) {
+        max_key = key;
+        has_rows = true;
+      }
+    }
+
+    if (!pack_insert_row_values(row_values, &schema, &user_table.row_layout,
+                                row_buf)) {
+      return SQL_EXEC_ROW_PACK_FAILED;
+    }
+
+    btree_result = insert_row_into_table(&user_table, key, row_buf);
+    if (btree_result == EXECUTE_DUPLICATE_KEY) {
+      return SQL_EXEC_DUPLICATE_KEY;
+    }
   }
   return SQL_EXEC_OK;
 }
@@ -2303,6 +2638,8 @@ SqlExecuteResult execute_select(Table* db, const SqlStatement* stmt) {
   uint32_t root_page;
   Table target;
   Cursor* cursor;
+  size_t widths[MAX_SCHEMA_COLUMNS];
+  uint32_t row_count = 0;
 
   if (!master_find_table(db, stmt->table_name, &schema, &root_page)) {
     return SQL_EXEC_TABLE_NOT_FOUND;
@@ -2311,12 +2648,79 @@ SqlExecuteResult execute_select(Table* db, const SqlStatement* stmt) {
   if (!table_init_user(&target, db->pager, root_page, &schema)) {
     return SQL_EXEC_SELECT_LAYOUT_INVALID;
   }
+
+  for (uint32_t i = 0; i < schema.column_count; i++) {
+    widths[i] = strlen(schema.column_names[i]);
+  }
+
   cursor = table_start(&target);
   while (!cursor->end_of_table) {
-    print_user_row(cursor_value(cursor), &schema, &target.row_layout);
+    const uint8_t* d = cursor_value(cursor);
+    for (uint32_t i = 0; i < schema.column_count; i++) {
+      if (schema.column_type[i] == COLUMN_TYPE_INT) {
+        uint32_t v;
+        char num_buf[32];
+        size_t n;
+        memcpy(&v, d + target.row_layout.col_offset[i], sizeof(uint32_t));
+        snprintf(num_buf, sizeof(num_buf), "%u", v);
+        n = strlen(num_buf);
+        if (n > widths[i]) {
+          widths[i] = n;
+        }
+      } else {
+        size_t n = bounded_text_len(
+            (const char*)(d + target.row_layout.col_offset[i]),
+            target.row_layout.col_size[i]);
+        if (n > widths[i]) {
+          widths[i] = n;
+        }
+      }
+    }
     cursor_advance(cursor);
   }
   free(cursor);
+
+  print_table_border(widths, schema.column_count);
+  printf("|");
+  for (uint32_t i = 0; i < schema.column_count; i++) {
+    print_table_cell_text(schema.column_names[i], widths[i], false);
+    printf("|");
+  }
+  printf("\n");
+  print_table_border(widths, schema.column_count);
+
+  cursor = table_start(&target);
+  while (!cursor->end_of_table) {
+    const uint8_t* d = cursor_value(cursor);
+    row_count++;
+    printf("|");
+    for (uint32_t i = 0; i < schema.column_count; i++) {
+      if (schema.column_type[i] == COLUMN_TYPE_INT) {
+        uint32_t v;
+        char num_buf[32];
+        memcpy(&v, d + target.row_layout.col_offset[i], sizeof(uint32_t));
+        snprintf(num_buf, sizeof(num_buf), "%u", v);
+        print_table_cell_text(num_buf, widths[i], true);
+      } else {
+        size_t n = bounded_text_len(
+            (const char*)(d + target.row_layout.col_offset[i]),
+            target.row_layout.col_size[i]);
+        char text_buf[256];
+        if (n >= sizeof(text_buf)) {
+          n = sizeof(text_buf) - 1;
+        }
+        memcpy(text_buf, d + target.row_layout.col_offset[i], n);
+        text_buf[n] = '\0';
+        print_table_cell_text(text_buf, widths[i], false);
+      }
+      printf("|");
+    }
+    printf("\n");
+    cursor_advance(cursor);
+  }
+  free(cursor);
+  print_table_border(widths, schema.column_count);
+  printf("(%u rows)\n", row_count);
   return SQL_EXEC_OK;
 }
 
@@ -2350,6 +2754,108 @@ SqlExecuteResult execute_delete(Table* db, const SqlStatement* stmt) {
   return SQL_EXEC_DELETE_RECORD_NOT_FOUND;
 }
 
+SqlExecuteResult execute_update(Table* db, const SqlStatement* stmt) {
+  SqlSchema schema;
+  uint32_t root_page;
+  Table target;
+  Cursor* cursor;
+  uint32_t num_cells;
+  uint32_t target_col = UINT32_MAX;
+  void* page;
+  uint8_t row_buf[LEAF_NODE_SPACE_FOR_CELLS];
+
+  if (!master_find_table(db, stmt->table_name, &schema, &root_page)) {
+    return SQL_EXEC_TABLE_NOT_FOUND;
+  }
+  if (!table_init_user(&target, db->pager, root_page, &schema)) {
+    return SQL_EXEC_SELECT_LAYOUT_INVALID;
+  }
+
+  for (uint32_t i = 0; i < schema.column_count; i++) {
+    if (strcasecmp(schema.column_names[i], stmt->update_column) == 0) {
+      target_col = i;
+      break;
+    }
+  }
+  if (target_col == UINT32_MAX) {
+    return SQL_EXEC_UPDATE_COLUMN_NOT_FOUND;
+  }
+  if (target_col == 0) {
+    return SQL_EXEC_UPDATE_PK_NOT_ALLOWED;
+  }
+
+  cursor = table_find(&target, stmt->id);
+  page = get_page(target.pager, cursor->page_num);
+  num_cells = *leaf_node_num_cells(page);
+  if (cursor->cell_num >= num_cells ||
+      *tbl_leaf_key(&target, page, cursor->cell_num) != stmt->id) {
+    free(cursor);
+    return SQL_EXEC_UPDATE_RECORD_NOT_FOUND;
+  }
+
+  memcpy(row_buf, tbl_leaf_value(&target, page, cursor->cell_num),
+         target.row_layout.value_size);
+
+  if (schema.column_type[target_col] == COLUMN_TYPE_INT) {
+    uint32_t v;
+    if (!parse_u32(stmt->update_value, &v)) {
+      printf("Type error: expected int for column %s.\n",
+             schema.column_names[target_col]);
+      free(cursor);
+      return SQL_EXEC_INSERT_VALIDATION_FAILED;
+    }
+    memcpy(row_buf + target.row_layout.col_offset[target_col], &v,
+           sizeof(uint32_t));
+  } else {
+    size_t len = strlen(stmt->update_value);
+    if (len > schema.column_max[target_col]) {
+      printf("String is too long.\n");
+      free(cursor);
+      return SQL_EXEC_INSERT_VALIDATION_FAILED;
+    }
+    memset(row_buf + target.row_layout.col_offset[target_col], 0,
+           target.row_layout.col_size[target_col]);
+    memcpy(row_buf + target.row_layout.col_offset[target_col],
+           stmt->update_value, len);
+  }
+
+  memcpy(tbl_leaf_value(&target, page, cursor->cell_num), row_buf,
+         target.row_layout.value_size);
+  mark_page_dirty(target.pager, cursor->page_num);
+  free(cursor);
+  return SQL_EXEC_OK;
+}
+
+SqlExecuteResult execute_drop_table(Table* db, const SqlStatement* stmt) {
+  Table master;
+  Cursor* cursor;
+  char name_buf[MAX_TABLE_NAME_LENGTH + 1];
+  char schema_buf[SCHEMA_TEXT_MAX + 1];
+  uint32_t dummy_root;
+
+  if (strcasecmp(stmt->table_name, "sqlite_master") == 0) {
+    return SQL_EXEC_RESERVED_DROP_TABLE;
+  }
+
+  table_init_catalog(&master, db->pager);
+  master.root_page_num = db->pager->master_root_page;
+  cursor = table_start(&master);
+  while (!cursor->end_of_table) {
+    void* node = get_page(db->pager, cursor->page_num);
+    catalog_read_value(tbl_leaf_value(&master, node, cursor->cell_num),
+                       &dummy_root, name_buf, schema_buf, sizeof(schema_buf));
+    if (strcasecmp(name_buf, stmt->table_name) == 0) {
+      leaf_node_delete(cursor);
+      free(cursor);
+      return SQL_EXEC_OK;
+    }
+    cursor_advance(cursor);
+  }
+
+  free(cursor);
+  return SQL_EXEC_TABLE_NOT_FOUND;
+}
+
 SqlExecuteResult execute_statement(Session* session, const SqlStatement* stmt) {
   Table* db = session->database;
 
@@ -2364,6 +2870,10 @@ SqlExecuteResult execute_statement(Session* session, const SqlStatement* stmt) {
       return execute_select(db, stmt);
     case SQL_STMT_DELETE:
       return execute_delete(db, stmt);
+    case SQL_STMT_UPDATE:
+      return execute_update(db, stmt);
+    case SQL_STMT_DROP_TABLE:
+      return execute_drop_table(db, stmt);
   }
   return SQL_EXEC_OK;
 }
@@ -2413,6 +2923,18 @@ static void print_sql_execute_result(SqlExecuteResult r) {
     case SQL_EXEC_DELETE_RECORD_NOT_FOUND:
       printf("Error: Record not found to delete.\n");
       break;
+    case SQL_EXEC_UPDATE_COLUMN_NOT_FOUND:
+      printf("Error: Column not found for update.\n");
+      break;
+    case SQL_EXEC_UPDATE_PK_NOT_ALLOWED:
+      printf("Error: Updating primary key is not supported.\n");
+      break;
+    case SQL_EXEC_UPDATE_RECORD_NOT_FOUND:
+      printf("Error: Record not found to update.\n");
+      break;
+    case SQL_EXEC_RESERVED_DROP_TABLE:
+      printf("Error: Cannot drop reserved table.\n");
+      break;
   }
 }
 
@@ -2420,7 +2942,10 @@ void execute_sql(Session* session, const SqlStatement* stmt) {
   SqlExecuteResult r = execute_statement(session, stmt);
   print_sql_execute_result(r);
   
-  if (r == SQL_EXEC_OK && (stmt->type == SQL_STMT_INSERT || stmt->type == SQL_STMT_CREATE_TABLE || stmt->type == SQL_STMT_CREATE_DATABASE || stmt->type == SQL_STMT_DELETE)) {
+  if (r == SQL_EXEC_OK &&
+      (stmt->type == SQL_STMT_INSERT || stmt->type == SQL_STMT_CREATE_TABLE ||
+       stmt->type == SQL_STMT_CREATE_DATABASE || stmt->type == SQL_STMT_DELETE ||
+       stmt->type == SQL_STMT_UPDATE || stmt->type == SQL_STMT_DROP_TABLE)) {
     if (session->database && session->database->pager) {
       pager_commit_transaction_sync(session->database->pager);
     }
@@ -2491,6 +3016,7 @@ MetaCommandResult do_meta_command(Session* session, InputBuffer* input_buffer) {
 int main(int argc, char* argv[]) {
   Session session;
   InputBuffer* input_buffer;
+  SqlStatement* stmt;
   const char* root_path;
 
   memset(&session, 0, sizeof(session));
@@ -2504,6 +3030,12 @@ int main(int argc, char* argv[]) {
   }
 
   input_buffer = new_input_buffer();
+  stmt = calloc(1, sizeof(SqlStatement));
+  if (stmt == NULL) {
+    printf("Unable to allocate statement buffer.\n");
+    close_input_buffer(input_buffer);
+    exit(EXIT_FAILURE);
+  }
   while (true) {
     print_prompt();
     read_input(input_buffer);
@@ -2511,6 +3043,7 @@ int main(int argc, char* argv[]) {
     if (input_buffer->buffer[0] == '.') {
       MetaCommandResult meta = do_meta_command(&session, input_buffer);
       if (meta == META_COMMAND_EXIT) {
+        free(stmt);
         close_input_buffer(input_buffer);
         if (session.database != NULL) {
           db_close(session.database);
@@ -2523,18 +3056,18 @@ int main(int argc, char* argv[]) {
       continue;
     }
 
-    SqlStatement stmt;
-    if (!parse_sql_statement(input_buffer->buffer, &stmt)) {
+    memset(stmt, 0, sizeof(*stmt));
+    if (!parse_sql_statement(input_buffer->buffer, stmt)) {
       printf("Syntax error. Could not parse SQL statement.\n");
       continue;
     }
 
-    if (stmt.type != SQL_STMT_CREATE_DATABASE &&
+    if (stmt->type != SQL_STMT_CREATE_DATABASE &&
         (!session.has_active_database || session.database == NULL)) {
       printf("No active database. Use .usedatabase <name>.\n");
       continue;
     }
 
-    execute_sql(&session, &stmt);
+    execute_sql(&session, stmt);
   }
 }
