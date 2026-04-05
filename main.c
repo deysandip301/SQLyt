@@ -1012,7 +1012,9 @@ void db_close(Table* table) {
   pager_commit_transaction_sync(pager);
 
   for (uint32_t i = 0; i < pager->num_pages; i++) {
-    if (pager->pages[i] == NULL) continue;
+    if (pager->pages[i] == NULL) {
+      continue;
+    }
     free(pager->pages[i]);
     pager->pages[i] = NULL;
   }
