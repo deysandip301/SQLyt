@@ -3,12 +3,27 @@
 ## Build
 
 ```bash
+make build
+```
+
+Or directly:
+
+```bash
 gcc -std=c11 -pthread main.c -o db
 ```
 
 Interactive line-editing enhancements (history, arrow-key navigation, and tab
 completion) are enabled automatically when `libreadline` is available at
 runtime.
+
+## Project Structure
+
+- `main.c` : shared types/constants and module wiring
+- `btree.c` : node/table/btree operations and tree balancing
+- `pager.c` : pager, WAL, checkpoint, open/close lifecycle
+- `parser.c` : SQL parsing and row/schema packing helpers
+- `cli.c` : REPL input, meta commands, SQL execution flow, main loop
+- `Makefile` : build/test/clean targets
 
 ## Run
 
