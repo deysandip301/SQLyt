@@ -175,9 +175,6 @@ SqlExecuteResult execute_create_table(Table* db, const SqlStatement* stmt) {
     return SQL_EXEC_ROW_LAYOUT_TOO_LARGE;
   }
 
-  root_page = allocate_next_root_page(db->pager);
-  create_table_root(db, root_page);
-
   if (strlen(stmt->table_name) >= CATALOG_TABLE_NAME_SIZE) {
     return SQL_EXEC_TABLE_NAME_TOO_LONG;
   }
@@ -185,6 +182,9 @@ SqlExecuteResult execute_create_table(Table* db, const SqlStatement* stmt) {
                            sizeof(schema_payload))) {
     return SQL_EXEC_SCHEMA_METADATA_TOO_LONG;
   }
+
+  root_page = allocate_next_root_page(db->pager);
+  create_table_root(db, root_page);
 
   catalog_write_value(root_page, stmt->table_name, schema_payload,
                       catalog_value);
@@ -617,7 +617,9 @@ MetaCommandResult do_meta_command(Session* session, InputBuffer* input_buffer) {
     return META_COMMAND_EXIT;
   }
 
-  if (strncmp(input_buffer->buffer, ".usedatabase", 12) == 0) {
+  if (strncmp(input_buffer->buffer, ".usedatabase", 12) == 0 &&
+      (input_buffer->buffer[12] == ' ' || input_buffer->buffer[12] == '\t' ||
+       input_buffer->buffer[12] == '\0')) {
     const char* db_name = input_buffer->buffer + 12;
     while (*db_name == ' ' || *db_name == '\t') {
       db_name++;

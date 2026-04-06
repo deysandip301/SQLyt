@@ -62,37 +62,40 @@ const uint32_t LEAF_NODE_KEY_OFFSET = 0;
 #define LEAF_NODE_SPACE_FOR_CELLS (PAGE_SIZE - LEAF_NODE_HEADER_SIZE)
 
 NodeType get_node_type(void* node) {
-  uint8_t value = *((uint8_t*)(node + NODE_TYPE_OFFSET));
+  uint8_t value = *(((uint8_t*)node) + NODE_TYPE_OFFSET);
   return (NodeType)value;
 }
 
 void set_node_type(void* node, NodeType type) {
   uint8_t value = type;
-  *((uint8_t*)(node + NODE_TYPE_OFFSET)) = value;
+  *(((uint8_t*)node) + NODE_TYPE_OFFSET) = value;
 }
 
 bool is_node_root(void* node) {
-  uint8_t value = *((uint8_t*)(node + IS_ROOT_OFFSET));
+  uint8_t value = *(((uint8_t*)node) + IS_ROOT_OFFSET);
   return (bool)value;
 }
 
 void set_node_root(void* node, bool is_root) {
   uint8_t value = is_root;
-  *((uint8_t*)(node + IS_ROOT_OFFSET)) = value;
+  *(((uint8_t*)node) + IS_ROOT_OFFSET) = value;
 }
 
-uint32_t* node_parent(void* node) { return node + PARENT_POINTER_OFFSET; }
+uint32_t* node_parent(void* node) {
+  return (uint32_t*)((uint8_t*)node + PARENT_POINTER_OFFSET);
+}
 
 uint32_t* internal_node_num_keys(void* node) {
-  return node + INTERNAL_NODE_NUM_KEYS_OFFSET;
+  return (uint32_t*)((uint8_t*)node + INTERNAL_NODE_NUM_KEYS_OFFSET);
 }
 
 uint32_t* internal_node_right_child(void* node) {
-  return node + INTERNAL_NODE_RIGHT_CHILD_OFFSET;
+  return (uint32_t*)((uint8_t*)node + INTERNAL_NODE_RIGHT_CHILD_OFFSET);
 }
 
 uint32_t* internal_node_cell(void* node, uint32_t cell_num) {
-  return node + INTERNAL_NODE_HEADER_SIZE + cell_num * INTERNAL_NODE_CELL_SIZE;
+  return (uint32_t*)((uint8_t*)node + INTERNAL_NODE_HEADER_SIZE +
+                     cell_num * INTERNAL_NODE_CELL_SIZE);
 }
 
 uint32_t* internal_node_child(void* node, uint32_t child_num) {
@@ -118,15 +121,16 @@ uint32_t* internal_node_child(void* node, uint32_t child_num) {
 }
 
 uint32_t* internal_node_key(void* node, uint32_t key_num) {
-  return (void*)internal_node_cell(node, key_num) + INTERNAL_NODE_CHILD_SIZE;
+  return (uint32_t*)((uint8_t*)internal_node_cell(node, key_num) +
+                     INTERNAL_NODE_CHILD_SIZE);
 }
 
 uint32_t* leaf_node_num_cells(void* node) {
-  return node + LEAF_NODE_NUM_CELLS_OFFSET;
+  return (uint32_t*)((uint8_t*)node + LEAF_NODE_NUM_CELLS_OFFSET);
 }
 
 uint32_t* leaf_node_next_leaf(void* node) {
-  return node + LEAF_NODE_NEXT_LEAF_OFFSET;
+  return (uint32_t*)((uint8_t*)node + LEAF_NODE_NEXT_LEAF_OFFSET);
 }
 
 void table_init_catalog(Table* t, Pager* pager) {

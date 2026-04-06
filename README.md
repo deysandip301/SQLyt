@@ -9,7 +9,7 @@ make build
 Or directly with gcc:
 
 ```bash
-gcc -std=c11 -pthread -Iinclude src/app.c src/readline_runtime.c src/btree.c src/pager.c src/parser.c src/cli.c -o db
+gcc -std=c11 -pthread -Iinclude src/app.c src/readline_runtime.c src/btree.c src/pager.c src/parser.c src/cli.c -ldl -o db
 ```
 
 ## Test

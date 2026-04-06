@@ -1,5 +1,6 @@
 CC := gcc
 CFLAGS := -std=c11 -pthread -Iinclude
+LDLIBS := -ldl
 TARGET := db
 SRC_DIR := src
 INC_DIR := include
@@ -14,7 +15,7 @@ all: build
 build: $(TARGET)
 
 $(TARGET): $(OBJS)
-	$(CC) $(CFLAGS) $(OBJS) -o $(TARGET)
+	$(CC) $(CFLAGS) $(OBJS) -o $(TARGET) $(LDLIBS)
 
 $(OBJ_DIR):
 	mkdir -p $(OBJ_DIR)

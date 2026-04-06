@@ -58,11 +58,19 @@ Pager* pager_open(const char* filename) {
   uint32_t last_commit_frame = 0;
   for (uint32_t i = 0; i < complete_frames; i++) {
     WalFrameHeader header;
-    read(wal_fd, &header, sizeof(WalFrameHeader));
+    ssize_t n = read(wal_fd, &header, sizeof(WalFrameHeader));
+    if (n != (ssize_t)sizeof(WalFrameHeader)) {
+      /* Truncated or corrupt WAL header — stop replaying */
+      complete_frames = i;
+      break;
+    }
+    if (lseek(wal_fd, PAGE_SIZE, SEEK_CUR) == (off_t)-1) {
+      complete_frames = i;
+      break;
+    }
     if (header.page_num < TABLE_MAX_PAGES) {
       pager->page_to_wal_frame[header.page_num] = i + 1;
     }
-    lseek(wal_fd, PAGE_SIZE, SEEK_CUR); // Skip page data
     if (header.is_commit) {
       last_commit_frame = i + 1;
     }
@@ -74,11 +82,16 @@ Pager* pager_open(const char* filename) {
     lseek(wal_fd, 0, SEEK_SET);
     for (uint32_t i = 0; i < last_commit_frame; i++) {
       WalFrameHeader header;
-      read(wal_fd, &header, sizeof(WalFrameHeader));
+      ssize_t n = read(wal_fd, &header, sizeof(WalFrameHeader));
+      if (n != (ssize_t)sizeof(WalFrameHeader)) {
+        break;
+      }
+      if (lseek(wal_fd, PAGE_SIZE, SEEK_CUR) == (off_t)-1) {
+        break;
+      }
       if (header.page_num < TABLE_MAX_PAGES) {
         pager->page_to_wal_frame[header.page_num] = i + 1;
       }
-      lseek(wal_fd, PAGE_SIZE, SEEK_CUR);
     }
   }
   pager->wal_frame_count = last_commit_frame;
