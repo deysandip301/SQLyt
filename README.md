@@ -6,6 +6,10 @@
 gcc -std=c11 -pthread main.c -o db
 ```
 
+Interactive line-editing enhancements (history, arrow-key navigation, and tab
+completion) are enabled automatically when `libreadline` is available at
+runtime.
+
 ## Run
 
 Default root folder is `./data`:

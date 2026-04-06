@@ -10,12 +10,110 @@
 #include <unistd.h>
 #include <sys/stat.h>
 #include <dirent.h>
+#include <dlfcn.h>
 
 typedef struct {
   char* buffer;
   size_t buffer_length;
   ssize_t input_length;
 } InputBuffer;
+
+typedef char* (*ReadlineGeneratorFn)(const char*, int);
+typedef char** (*ReadlineCompletionMatchesFn)(const char*, ReadlineGeneratorFn);
+typedef char** (*ReadlineCompletionFn)(const char*, int, int);
+
+typedef struct {
+  bool initialized;
+  bool enabled;
+  void* handle;
+  char* (*readline_fn)(const char*);
+  void (*add_history_fn)(const char*);
+  void (*using_history_fn)(void);
+  void (*stifle_history_fn)(int);
+  ReadlineCompletionMatchesFn completion_matches_fn;
+  ReadlineCompletionFn* attempted_completion_slot;
+} ReadlineApi;
+
+static ReadlineApi g_readline_api = {0};
+
+static const char* g_meta_completion_words[] = {
+    ".exit", ".usedatabase", ".showdatabases", ".showtables", ".btree",
+    ".constants", NULL};
+
+static const char* g_sql_completion_words[] = {
+    "create", "database", "table", "insert", "into", "values", "select",
+    "from", "delete", "where", "update", "set", "drop", "primary", "key",
+    "int", "text", "null", NULL};
+
+static char* sqlyt_completion_generator(const char* text, int state) {
+  static const char** words;
+  static size_t index;
+  size_t text_len = strlen(text);
+
+  if (state == 0) {
+    words = (text_len > 0 && text[0] == '.') ? g_meta_completion_words
+                                             : g_sql_completion_words;
+    index = 0;
+  }
+
+  while (words[index] != NULL) {
+    const char* candidate = words[index++];
+    if (strncasecmp(candidate, text, text_len) == 0) {
+      return strdup(candidate);
+    }
+  }
+  return NULL;
+}
+
+static char** sqlyt_completion(const char* text, int start, int end) {
+  (void)start;
+  (void)end;
+  if (g_readline_api.completion_matches_fn == NULL) {
+    return NULL;
+  }
+  return g_readline_api.completion_matches_fn(text, sqlyt_completion_generator);
+}
+
+static bool init_readline_if_needed(void) {
+  if (g_readline_api.initialized) {
+    return g_readline_api.enabled;
+  }
+
+  g_readline_api.initialized = true;
+  g_readline_api.handle = dlopen("libreadline.so.8", RTLD_LAZY);
+  if (g_readline_api.handle == NULL) {
+    g_readline_api.handle = dlopen("libreadline.so", RTLD_LAZY);
+  }
+  if (g_readline_api.handle == NULL) {
+    return false;
+  }
+
+  g_readline_api.readline_fn = dlsym(g_readline_api.handle, "readline");
+  g_readline_api.add_history_fn = dlsym(g_readline_api.handle, "add_history");
+  g_readline_api.using_history_fn = dlsym(g_readline_api.handle, "using_history");
+  g_readline_api.stifle_history_fn = dlsym(g_readline_api.handle, "stifle_history");
+  g_readline_api.completion_matches_fn =
+      dlsym(g_readline_api.handle, "rl_completion_matches");
+  g_readline_api.attempted_completion_slot =
+      dlsym(g_readline_api.handle, "rl_attempted_completion_function");
+
+  if (g_readline_api.readline_fn == NULL || g_readline_api.add_history_fn == NULL ||
+      g_readline_api.using_history_fn == NULL ||
+      g_readline_api.stifle_history_fn == NULL ||
+      g_readline_api.completion_matches_fn == NULL ||
+      g_readline_api.attempted_completion_slot == NULL) {
+    dlclose(g_readline_api.handle);
+    memset(&g_readline_api, 0, sizeof(g_readline_api));
+    g_readline_api.initialized = true;
+    return false;
+  }
+
+  g_readline_api.using_history_fn();
+  g_readline_api.stifle_history_fn(1000);
+  *g_readline_api.attempted_completion_slot = sqlyt_completion;
+  g_readline_api.enabled = true;
+  return true;
+}
 
 typedef enum {
   EXECUTE_SUCCESS,
@@ -858,22 +956,86 @@ InputBuffer* new_input_buffer() {
 void print_prompt() { printf("db > "); }
 
 void read_input(InputBuffer* input_buffer) {
-  ssize_t bytes_read =
-      getline(&(input_buffer->buffer), &(input_buffer->buffer_length), stdin);
-
-  if (bytes_read <= 0) {
-    printf("Error reading input\n");
-    exit(EXIT_FAILURE);
+  if (isatty(STDIN_FILENO) && init_readline_if_needed()) {
+    char* line;
+    line = g_readline_api.readline_fn("db > ");
+    if (line == NULL) {
+      free(input_buffer->buffer);
+      input_buffer->buffer = strdup(".exit");
+      if (input_buffer->buffer == NULL) {
+        printf("Error reading input\n");
+        exit(EXIT_FAILURE);
+      }
+      input_buffer->input_length = 5;
+      input_buffer->buffer_length = 6;
+      return;
+    }
+    if (line[0] != '\0') {
+      g_readline_api.add_history_fn(line);
+    }
+    free(input_buffer->buffer);
+    input_buffer->buffer = line;
+    input_buffer->input_length = (ssize_t)strlen(line);
+    input_buffer->buffer_length = (size_t)input_buffer->input_length + 1;
+    return;
   }
 
-  // Ignore trailing newline
-  input_buffer->input_length = bytes_read - 1;
-  input_buffer->buffer[bytes_read - 1] = 0;
+  {
+    if (isatty(STDIN_FILENO)) {
+      print_prompt();
+      fflush(stdout);
+    }
+
+    ssize_t bytes_read =
+        getline(&(input_buffer->buffer), &(input_buffer->buffer_length), stdin);
+
+    if (bytes_read <= 0) {
+      printf("Error reading input\n");
+      exit(EXIT_FAILURE);
+    }
+
+    // Ignore trailing newline
+    input_buffer->input_length = bytes_read - 1;
+    input_buffer->buffer[bytes_read - 1] = 0;
+  }
 }
 
 void close_input_buffer(InputBuffer* input_buffer) {
   free(input_buffer->buffer);
   free(input_buffer);
+}
+
+static void normalize_input_line(InputBuffer* input_buffer) {
+  char* s;
+  size_t len;
+  size_t start = 0;
+  size_t end;
+
+  if (input_buffer == NULL || input_buffer->buffer == NULL) {
+    return;
+  }
+
+  s = input_buffer->buffer;
+  len = strlen(s);
+
+  while (start < len && (s[start] == ' ' || s[start] == '\t' ||
+                         s[start] == '\n' || s[start] == '\r')) {
+    start++;
+  }
+
+  end = len;
+  while (end > start &&
+         (s[end - 1] == ' ' || s[end - 1] == '\t' || s[end - 1] == '\n' ||
+          s[end - 1] == '\r')) {
+    end--;
+  }
+
+  if (start > 0 && end >= start) {
+    memmove(s, s + start, end - start);
+  }
+  s[end - start] = '\0';
+  input_buffer->input_length = (ssize_t)(end - start);
+  input_buffer->buffer_length = (size_t)input_buffer->input_length + 1;
 }
 
 void pager_flush(Pager* pager, uint32_t page_num, uint32_t is_commit) {
@@ -2957,8 +3119,15 @@ MetaCommandResult do_meta_command(Session* session, InputBuffer* input_buffer) {
     return META_COMMAND_EXIT;
   }
 
-  if (strncmp(input_buffer->buffer, ".usedatabase ", 13) == 0) {
-    const char* db_name = input_buffer->buffer + 13;
+  if (strncmp(input_buffer->buffer, ".usedatabase", 12) == 0) {
+    const char* db_name = input_buffer->buffer + 12;
+    while (*db_name == ' ' || *db_name == '\t') {
+      db_name++;
+    }
+    if (*db_name == '\0') {
+      printf("Unable to use database.\n");
+      return META_COMMAND_SUCCESS;
+    }
     if (!switch_database(session, db_name)) {
       printf("Unable to use database.\n");
     } else {
@@ -3037,8 +3206,11 @@ int main(int argc, char* argv[]) {
     exit(EXIT_FAILURE);
   }
   while (true) {
-    print_prompt();
+    if (!isatty(STDIN_FILENO)) {
+      print_prompt();
+    }
     read_input(input_buffer);
+    normalize_input_line(input_buffer);
 
     if (input_buffer->buffer[0] == '.') {
       MetaCommandResult meta = do_meta_command(&session, input_buffer);
