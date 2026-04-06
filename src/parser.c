@@ -1,3 +1,5 @@
+#include "sqlyt.h"
+
 bool ensure_directory(const char* path) {
   struct stat st;
   if (stat(path, &st) == 0) {
@@ -191,7 +193,7 @@ static bool parse_insert_values_clause(const char* values_start,
   return true;
 }
 
-static size_t bounded_text_len(const char* text, size_t max_len) {
+size_t bounded_text_len(const char* text, size_t max_len) {
   size_t n = 0;
   while (n < max_len && text[n] != '\0') {
     n++;
@@ -199,7 +201,7 @@ static size_t bounded_text_len(const char* text, size_t max_len) {
   return n;
 }
 
-static void print_table_border(const size_t* widths, uint32_t count) {
+void print_table_border(const size_t* widths, uint32_t count) {
   printf("+");
   for (uint32_t i = 0; i < count; i++) {
     for (size_t j = 0; j < widths[i] + 2; j++) {
@@ -210,8 +212,7 @@ static void print_table_border(const size_t* widths, uint32_t count) {
   printf("\n");
 }
 
-static void print_table_cell_text(const char* text, size_t width,
-                                  bool right_align) {
+void print_table_cell_text(const char* text, size_t width, bool right_align) {
   size_t len = strlen(text);
   size_t pad = (width > len) ? (width - len) : 0;
 
@@ -410,7 +411,7 @@ bool master_find_table(Table* db, const char* table_name, SqlSchema* schema,
   return false;
 }
 
-static uint32_t find_table_max_key(Table* table, bool* has_rows) {
+uint32_t find_table_max_key(Table* table, bool* has_rows) {
   Cursor* cursor = table_start(table);
   uint32_t max_key = 0;
 
@@ -426,7 +427,7 @@ static uint32_t find_table_max_key(Table* table, bool* has_rows) {
   return max_key;
 }
 
-static bool table_has_key(Table* table, uint32_t key) {
+bool table_has_key(Table* table, uint32_t key) {
   Cursor* cursor = table_find(table, key);
   void* node = get_page(table->pager, cursor->page_num);
   uint32_t num_cells = *leaf_node_num_cells(node);

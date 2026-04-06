@@ -1,3 +1,5 @@
+#include "sqlyt.h"
+
 Pager* pager_open(const char* filename) {
   int fd = open(filename,
                 O_RDWR |      // Read/Write mode
@@ -100,7 +102,8 @@ bool header_is_valid(const DbFileHeader* header) {
   return true;
 }
 
-uint32_t recover_next_root_page_from_master(Pager* pager, uint32_t master_root_page) {
+uint32_t recover_next_root_page_from_master(Pager* pager,
+                                            uint32_t master_root_page) {
   Table master_table;
   Cursor* cursor;
   uint32_t max_root = master_root_page;
@@ -163,7 +166,8 @@ Table* db_open(const char* filename) {
         set_node_root(repaired_root, true);
       }
 
-      repaired_next_root = recover_next_root_page_from_master(pager, repaired_master_root);
+      repaired_next_root =
+          recover_next_root_page_from_master(pager, repaired_master_root);
 
       memset(header, 0, PAGE_SIZE);
       memcpy(header->magic, DB_HEADER_MAGIC, sizeof(header->magic));
@@ -199,13 +203,15 @@ void pager_flush(Pager* pager, uint32_t page_num, uint32_t is_commit) {
   header.page_num = page_num;
   header.is_commit = is_commit;
   
-  if (write(pager->wal_file_descriptor, &header, sizeof(WalFrameHeader)) != sizeof(WalFrameHeader)) {
-      printf("Error writing WAL header: %d\n", errno);
-      exit(EXIT_FAILURE);
+  if (write(pager->wal_file_descriptor, &header, sizeof(WalFrameHeader)) !=
+      sizeof(WalFrameHeader)) {
+    printf("Error writing WAL header: %d\n", errno);
+    exit(EXIT_FAILURE);
   }
-  if (write(pager->wal_file_descriptor, pager->pages[page_num], PAGE_SIZE) != PAGE_SIZE) {
-      printf("Error writing WAL page: %d\n", errno);
-      exit(EXIT_FAILURE);
+  if (write(pager->wal_file_descriptor, pager->pages[page_num], PAGE_SIZE) !=
+      PAGE_SIZE) {
+    printf("Error writing WAL page: %d\n", errno);
+    exit(EXIT_FAILURE);
   }
 
   pager->page_to_wal_frame[page_num] = frame_index + 1;
@@ -221,7 +227,9 @@ void* background_checkpoint_task(void* arg) {
   for (uint32_t i = 0; i < TABLE_MAX_PAGES; i++) {
     if (pager->page_to_wal_frame[i] > 0) {
       uint32_t frame_index = pager->page_to_wal_frame[i] - 1;
-      off_t wal_offset = frame_index * (sizeof(WalFrameHeader) + PAGE_SIZE) + sizeof(WalFrameHeader);
+      off_t wal_offset =
+          frame_index * (sizeof(WalFrameHeader) + PAGE_SIZE) +
+          sizeof(WalFrameHeader);
 
       void* page = malloc(PAGE_SIZE);
       if (page == NULL) {
@@ -300,7 +308,9 @@ void pager_commit_transaction_sync(Pager* pager) {
     }
   }
   
-  if (dirty_count == 0) return;
+  if (dirty_count == 0) {
+    return;
+  }
 
   for (uint32_t i = 0; i < TABLE_MAX_PAGES; i++) {
     if (pager->page_dirty[i]) {
@@ -310,8 +320,9 @@ void pager_commit_transaction_sync(Pager* pager) {
   }
 
   pthread_mutex_lock(&pager->wal_mutex);
-  bool should_checkpoint = (pager->wal_frame_count >= WAL_CHECKPOINT_THRESHOLD &&
-                             !pager->checkpoint_in_progress);
+  bool should_checkpoint =
+      (pager->wal_frame_count >= WAL_CHECKPOINT_THRESHOLD &&
+       !pager->checkpoint_in_progress);
   if (should_checkpoint) {
     pager->checkpoint_in_progress = true;
   }

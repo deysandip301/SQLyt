@@ -1,3 +1,5 @@
+#include "sqlyt.h"
+
 void mark_page_dirty(Pager* pager, uint32_t page_num) {
   if (page_num < TABLE_MAX_PAGES) {
     pager->page_dirty[page_num] = 1;
@@ -5,26 +7,6 @@ void mark_page_dirty(Pager* pager, uint32_t page_num) {
 }
 
 void pager_commit_transaction_sync(Pager* pager);
-
-struct Table {
-  Pager* pager;
-  uint32_t root_page_num;
-  bool is_catalog;
-  uint32_t value_size;
-  uint32_t cell_size;
-  uint32_t max_cells;
-  SqlSchema schema;
-  RowLayout row_layout;
-};
-
-typedef struct {
-  Table* table;
-  uint32_t page_num;
-  uint32_t cell_num;
-  bool end_of_table;  // Indicates a position one past the last element
-} Cursor;
-
-typedef enum { NODE_INTERNAL, NODE_LEAF } NodeType;
 
 /*
  * Common Node Header Layout
@@ -195,11 +177,11 @@ static inline void* tbl_leaf_cell(Table* t, void* node, uint32_t cell_num) {
   return (uint8_t*)node + LEAF_NODE_HEADER_SIZE + cell_num * t->cell_size;
 }
 
-static inline uint32_t* tbl_leaf_key(Table* t, void* node, uint32_t cell_num) {
+uint32_t* tbl_leaf_key(Table* t, void* node, uint32_t cell_num) {
   return (uint32_t*)tbl_leaf_cell(t, node, cell_num);
 }
 
-static inline void* tbl_leaf_value(Table* t, void* node, uint32_t cell_num) {
+void* tbl_leaf_value(Table* t, void* node, uint32_t cell_num) {
   return (uint8_t*)tbl_leaf_cell(t, node, cell_num) + LEAF_NODE_KEY_SIZE;
 }
 
@@ -231,7 +213,9 @@ void* get_page(Pager* pager, uint32_t page_num) {
     pthread_mutex_lock(&pager->wal_mutex);
     if (pager->page_to_wal_frame[page_num] > 0) {
       uint32_t frame_index = pager->page_to_wal_frame[page_num] - 1;
-      off_t offset = frame_index * (sizeof(WalFrameHeader) + PAGE_SIZE) + sizeof(WalFrameHeader);
+      off_t offset =
+          frame_index * (sizeof(WalFrameHeader) + PAGE_SIZE) +
+          sizeof(WalFrameHeader);
       lseek(pager->wal_file_descriptor, offset, SEEK_SET);
       ssize_t bytes_read = read(pager->wal_file_descriptor, page, PAGE_SIZE);
       pthread_mutex_unlock(&pager->wal_mutex);

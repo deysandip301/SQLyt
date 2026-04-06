@@ -6,10 +6,16 @@
 make build
 ```
 
-Or directly:
+Or directly with gcc:
 
 ```bash
-gcc -std=c11 -pthread main.c -o db
+gcc -std=c11 -pthread -Iinclude src/app.c src/readline_runtime.c src/btree.c src/pager.c src/parser.c src/cli.c -o db
+```
+
+## Test
+
+```bash
+make test
 ```
 
 Interactive line-editing enhancements (history, arrow-key navigation, and tab
@@ -18,12 +24,61 @@ runtime.
 
 ## Project Structure
 
-- `main.c` : shared types/constants and module wiring
-- `btree.c` : node/table/btree operations and tree balancing
-- `pager.c` : pager, WAL, checkpoint, open/close lifecycle
-- `parser.c` : SQL parsing and row/schema packing helpers
-- `cli.c` : REPL input, meta commands, SQL execution flow, main loop
-- `Makefile` : build/test/clean targets
+```text
+SQLyt/
+├── include/
+│   └── sqlyt.h        # shared types, constants, and cross-module interfaces
+├── src/
+│   ├── app.c          # program entrypoint (`main`) and startup loop
+│   ├── readline_runtime.c
+│   │                   # readline runtime integration and completion wiring
+│   ├── btree.c        # B+ tree layout, cursor operations, insert/delete/rebalance
+│   ├── pager.c        # pager, WAL, checkpointing, open/close lifecycle
+│   ├── parser.c       # SQL parsing, schema encoding, row pack/unpack helpers
+│   └── cli.c          # REPL helpers, meta-commands, and SQL execution routing
+├── tests/
+│   └── test_main.py   # end-to-end SQL and storage behavior tests
+├── data/              # default runtime root path for databases
+├── Makefile           # build/test/clean targets
+└── README.md
+```
+
+## Architecture
+
+At a high level, SQLyt is organized into six layers:
+
+1. Application entry layer (`src/app.c`)
+- Defines `main()`.
+- Initializes session/root path and drives the input/execute loop.
+
+2. CLI layer (`src/cli.c`)
+- Reads input, normalizes commands, handles meta-commands.
+- Dispatches parsed SQL statements to execution paths.
+
+3. Readline runtime layer (`src/readline_runtime.c`)
+- Dynamically loads readline when available.
+- Provides history and tab-completion integration.
+
+4. Parsing and row-shaping layer (`src/parser.c`)
+- Parses SQL text into `SqlStatement` structures.
+- Encodes schema metadata and row payloads.
+
+5. B+ tree layer (`src/btree.c`)
+- Navigates and mutates table/index nodes.
+- Handles node split, merge, and rebalancing.
+
+6. Pager and durability layer (`src/pager.c`)
+- Manages page cache and file I/O.
+- Implements WAL frame writes and checkpointing.
+
+Shared contract layer (`include/sqlyt.h`)
+- Defines shared structs, enums, constants, and function contracts across modules.
+
+Execution flow:
+
+```text
+CLI input -> parser -> statement executor -> btree operations -> pager/WAL -> disk
+```
 
 ## Run
 
