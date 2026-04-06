@@ -618,6 +618,7 @@ MetaCommandResult do_meta_command(Session* session, InputBuffer* input_buffer) {
   }
 
   if (strncmp(input_buffer->buffer, ".usedatabase", 12) == 0 &&
+      input_buffer->input_length >= 12 &&
       (input_buffer->buffer[12] == ' ' || input_buffer->buffer[12] == '\t' ||
        input_buffer->buffer[12] == '\0')) {
     const char* db_name = input_buffer->buffer + 12;

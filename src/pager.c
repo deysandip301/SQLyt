@@ -84,9 +84,11 @@ Pager* pager_open(const char* filename) {
       WalFrameHeader header;
       ssize_t n = read(wal_fd, &header, sizeof(WalFrameHeader));
       if (n != (ssize_t)sizeof(WalFrameHeader)) {
+        /* Unexpected short read in already-committed frames; treat as corrupt */
         break;
       }
       if (lseek(wal_fd, PAGE_SIZE, SEEK_CUR) == (off_t)-1) {
+        /* Seek failed; stop rebuilding the mapping */
         break;
       }
       if (header.page_num < TABLE_MAX_PAGES) {
