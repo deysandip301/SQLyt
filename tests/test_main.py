@@ -10,17 +10,7 @@ import unittest
 class TestSQLytSQLMode(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        compile_cmd = [
-            "gcc",
-            "-std=c11",
-            #"-Wall",
-            #"-Wextra",
-            # "-Werror",
-            #"-pedantic",
-            "main.c",
-            "-o",
-            "db",
-        ]
+        compile_cmd = ["make", "build"]
         result = subprocess.run(compile_cmd, capture_output=True, text=True)
         if result.returncode != 0:
             raise RuntimeError(
